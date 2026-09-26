@@ -38,6 +38,7 @@ namespace dials { namespace algorithms {
     int n_restarts;              // number of attempts when fitting
     bool optimize_profile;       // If false the profile is generated with input params
     bool show_profile_failures;  // Prints debugging information
+    double fwhm_smoothing_window;  // Time over which to smooth before estimating sigma
 
     TOFProfile1DIBIXParams(double A_min,
                            double A_max,
@@ -49,7 +50,8 @@ namespace dials { namespace algorithms {
                            double beta_max,
                            int n_restarts,
                            bool optimize_profile,
-                           bool show_profile_failures)
+                           bool show_profile_failures,
+                           double fwhm_smoothing_window)
 
         : A(A_min),
           A_min(A_min),
@@ -62,7 +64,8 @@ namespace dials { namespace algorithms {
           beta_max(beta_max),
           n_restarts(n_restarts),
           optimize_profile(optimize_profile),
-          show_profile_failures(show_profile_failures) {}
+          show_profile_failures(show_profile_failures),
+          fwhm_smoothing_window(fwhm_smoothing_window) {}
   };
 
   static scitbx::af::shared<double> profile1d_func(scitbx::af::const_ref<double> tof,
@@ -195,6 +198,7 @@ namespace dials { namespace algorithms {
 
     // params
     double A, alpha, beta, sigma, T_ph;
+    double fwhm_smoothing_window;
     std::array<double, 5> min_bounds;
     std::array<double, 5> max_bounds;
 
@@ -207,7 +211,8 @@ namespace dials { namespace algorithms {
                      const std::array<double, 2> A_bounds,
                      const std::array<double, 2> alpha_bounds,
                      const std::array<double, 2> beta_bounds,
-                     int n_restarts_)
+                     int n_restarts_,
+                     double fwhm_smoothing_window_)
         : tof(tof_),
           intensities(intensities_),
           A(A_),
@@ -215,6 +220,7 @@ namespace dials { namespace algorithms {
           beta(beta_),
           sigma(1.0),
           T_ph(T_ph_),
+          fwhm_smoothing_window(fwhm_smoothing_window_),
           n_restarts(n_restarts_) {
       DIALS_ASSERT(tof.size() > 0);
       DIALS_ASSERT(tof.size() == intensities.size());
@@ -240,13 +246,21 @@ namespace dials { namespace algorithms {
       sigma = estimate_sigma_from_fwhm(tof, y_norm.const_ref());
 
       // Param bounds (A, alpha, beta, sigma, T_ph)
+      /*
+       * The upper bound on sigma is taken from the span of the box rather than
+       * a fixed time, so that it does not depend on how finely the data are
+       * sliced.  A fixed 100 us bound is narrower than a real peak on some
+       * instruments, and on finely sliced data it is the estimate below, not
+       * sigma * 4, that sets the bound.
+       */
+      double tof_span = tof.back() - tof.front();
       min_bounds = {
         A_bounds[0], alpha_bounds[0], beta_bounds[0], sigma / 4.0, tof.front()};
 
       max_bounds = {A_bounds[1],
                     alpha_bounds[1],
                     beta_bounds[1],
-                    std::max(100., sigma * 4.0),
+                    std::max(tof_span / 4.0, sigma * 4.0),
                     tof.back()};
 
       // Sanity check params
@@ -279,9 +293,38 @@ namespace dials { namespace algorithms {
         return 1.0;
       }
 
+      double mean_dt = (tof.back() - tof.front()) / std::max<size_t>(tof.size() - 1, 1);
+
+      /*
+       * The half-maximum search runs on a boxcar-smoothed copy of the
+       * projection.  The window is a fixed time rather than a fixed number of
+       * bins, so that the width estimated here does not depend on how finely
+       * the data are sliced.  Without it, narrow bins hold few enough counts
+       * that the tallest channel is a noise spike its neighbours fall to half
+       * of within one bin: the estimate collapses onto mean_dt and the fit is
+       * seeded several times too narrow.
+       */
+      scitbx::af::shared<double> y_smooth(y.size());
+      int half_window = static_cast<int>(0.5 * fwhm_smoothing_window / mean_dt);
+      if (half_window < 1) {
+        std::copy(y.begin(), y.end(), y_smooth.begin());
+      } else {
+        int n = static_cast<int>(y.size());
+        for (int i = 0; i < n; ++i) {
+          int lo = std::max(0, i - half_window);
+          int hi = std::min(n - 1, i + half_window);
+          double total = 0.0;
+          for (int j = lo; j <= hi; ++j) {
+            total += y[j];
+          }
+          y_smooth[i] = total / (hi - lo + 1);
+        }
+      }
+      scitbx::af::const_ref<double> ys = y_smooth.const_ref();
+
       // locate peak
-      size_t imax = std::distance(y.begin(), std::max_element(y.begin(), y.end()));
-      double ymax = y[imax];
+      size_t imax = std::distance(ys.begin(), std::max_element(ys.begin(), ys.end()));
+      double ymax = ys[imax];
 
       // Negative peak
       if (ymax <= 0.0) {
@@ -293,9 +336,9 @@ namespace dials { namespace algorithms {
       // Search left crossing
       double tL = tof.front();
       for (size_t i = imax; i-- > 0;) {
-        if (y[i] <= half_max && y[i + 1] > half_max) {
+        if (ys[i] <= half_max && ys[i + 1] > half_max) {
           double t0 = tof[i], t1 = tof[i + 1];
-          double y0 = y[i], y1 = y[i + 1];
+          double y0 = ys[i], y1 = ys[i + 1];
           double frac = (half_max - y0) / (y1 - y0);
           tL = t0 + frac * (t1 - t0);
           break;
@@ -304,10 +347,10 @@ namespace dials { namespace algorithms {
 
       // Search right crossing
       double tR = tof.back();
-      for (size_t i = imax; i + 1 < y.size(); ++i) {
-        if (y[i] > half_max && y[i + 1] <= half_max) {
+      for (size_t i = imax; i + 1 < ys.size(); ++i) {
+        if (ys[i] > half_max && ys[i + 1] <= half_max) {
           double t0 = tof[i], t1 = tof[i + 1];
-          double y0 = y[i], y1 = y[i + 1];
+          double y0 = ys[i], y1 = ys[i + 1];
           double frac = (half_max - y0) / (y1 - y0);
           tR = t0 + frac * (t1 - t0);
           break;
@@ -322,7 +365,6 @@ namespace dials { namespace algorithms {
       double sigma0 = fwhm / 2.354820045;
 
       // Unphysical sigma (check large as at least one sample spacing)
-      double mean_dt = (tof.back() - tof.front()) / std::max<size_t>(tof.size() - 1, 1);
       sigma0 = std::max(sigma0, mean_dt);
       return sigma0;
     }
@@ -577,7 +619,8 @@ namespace dials { namespace algorithms {
                              A_bounds,
                              alpha_bounds,
                              beta_bounds,
-                             profile_params.n_restarts);
+                             profile_params.n_restarts,
+                             profile_params.fwhm_smoothing_window);
 
     bool profile_success = true;
     if (profile_params.optimize_profile) {
