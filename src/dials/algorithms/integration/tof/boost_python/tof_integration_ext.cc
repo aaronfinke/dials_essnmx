@@ -168,7 +168,8 @@ namespace dials { namespace algorithms { namespace boost_python {
                                           object profile_3d_ic_params_obj,
                                           object profile_3d_ibix_params_obj,
                                           double library_min_i_sigma,
-                                          double library_min_corr) {
+                                          double library_min_corr,
+                                          double lorentz_wavelength_power) {
     boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
     boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params;
 
@@ -197,7 +198,8 @@ namespace dials { namespace algorithms { namespace boost_python {
                                absorption_params,
                                apply_lorentz,
                                n_threads,
-                               profile_fitter);
+                               profile_fitter,
+                               lorentz_wavelength_power);
   }
 
   void extract_correction_params(
@@ -536,7 +538,8 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("profile_3d_ic_params") = object(),
          arg("profile_3d_ibix_params") = object(),
          arg("library_min_i_sigma") = -1.0,
-         arg("library_min_corr") = 0.5));
+         arg("library_min_corr") = 0.5,
+         arg("lorentz_wavelength_power") = 4.0));
 
     def("calculate_line_profile_for_reflection",
         &calculate_line_profile_for_reflection_wrapper,
