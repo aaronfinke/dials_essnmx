@@ -378,7 +378,8 @@ namespace dials { namespace algorithms { namespace boost_python {
                 double,
                 int,
                 bool,
-                bool>())
+                bool,
+                double>())
       .def_readwrite("A", &TOFProfile1DIBIXParams::A)
       .def_readwrite("A_min", &TOFProfile1DIBIXParams::A_min)
       .def_readwrite("A_max", &TOFProfile1DIBIXParams::A_max)
@@ -391,7 +392,9 @@ namespace dials { namespace algorithms { namespace boost_python {
       .def_readwrite("n_restarts", &TOFProfile1DIBIXParams::n_restarts)
       .def_readwrite("optimize_profile", &TOFProfile1DIBIXParams::optimize_profile)
       .def_readwrite("show_profile_failures",
-                     &TOFProfile1DIBIXParams::show_profile_failures);
+                     &TOFProfile1DIBIXParams::show_profile_failures)
+      .def_readwrite("fwhm_smoothing_window",
+                     &TOFProfile1DIBIXParams::fwhm_smoothing_window);
 
     class_<TOFProfile1DICParams, std::shared_ptr<TOFProfile1DICParams>>(
       "TOFProfile1DICParams", no_init)

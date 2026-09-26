@@ -176,6 +176,12 @@ profile_1d_ibix{
     n_restarts = 100
         .type = int(value_min=0)
         .help = "If fit fails, number of additional attempts with perturbed params"
+    fwhm_smoothing_window = 60.0
+        .type = float(value_min=0)
+        .help = "Time in us over which the projection is smoothed before its"
+                "full width at half maximum is measured to seed sigma. A fixed"
+                "time rather than a fixed number of bins, so that the seed does"
+                "not depend on the ToF bin width. Set to 0 to disable."
 
 }
 profile_1d_ic{
@@ -539,6 +545,7 @@ def integrate_reflection_table_for_experiment(
             n_restarts,
             True,
             show_profile_failures,
+            params.profile_1d_ibix.fwhm_smoothing_window,
         )
     elif params.method == "profile_1d_ic":
         p = params.profile_1d_ic
