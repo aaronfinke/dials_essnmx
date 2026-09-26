@@ -53,6 +53,7 @@ namespace dials { namespace algorithms {
     double fwhm_smoothing_window;  // Time over which to smooth before estimating sigma
     double trust_min_corr;         // Correlation with the data a fit must reach
     double trust_peak_tolerance;   // How far the fitted peak may sit from the data's
+    double trust_peak_height_fraction;  // Allowed relative error on the peak height
 
     TOFProfile1DIBIXParams(double A_min,
                            double A_max,
@@ -67,7 +68,8 @@ namespace dials { namespace algorithms {
                            bool show_profile_failures,
                            double fwhm_smoothing_window,
                            double trust_min_corr,
-                           double trust_peak_tolerance)
+                           double trust_peak_tolerance,
+                           double trust_peak_height_fraction)
 
         : A(A_min),
           A_min(A_min),
@@ -83,7 +85,8 @@ namespace dials { namespace algorithms {
           show_profile_failures(show_profile_failures),
           fwhm_smoothing_window(fwhm_smoothing_window),
           trust_min_corr(trust_min_corr),
-          trust_peak_tolerance(trust_peak_tolerance) {}
+          trust_peak_tolerance(trust_peak_tolerance),
+          trust_peak_height_fraction(trust_peak_height_fraction) {}
   };
 
   static scitbx::af::shared<double> profile1d_func(scitbx::af::const_ref<double> tof,
@@ -152,6 +155,47 @@ namespace dials { namespace algorithms {
     return is_finite_double(a) && a > 0.0 ? a : 1.0;
   }
 
+  /*
+   * Bounds by reparameterisation rather than by clamping.
+   *
+   * Eigen's LevenbergMarquardt is unconstrained.  Imposing bounds by clamping
+   * the parameter vector inside the residual and the Jacobian, as this file
+   * used to, makes the model constant outside the box: the optimiser then sees
+   * no change from a step that leaves it, a parameter sitting on a bound gets a
+   * zero Jacobian column, and the trust region has no direction to move in.
+   * Instead every bounded parameter is carried internally as an unbounded
+   * variable u, with p = lo + (hi - lo) / (1 + exp(-u)).  The map is smooth and
+   * strictly monotone, every u is feasible, and the optimisation is genuinely
+   * unconstrained, so the bounds cost nothing in conditioning.
+   */
+  inline double bounded_to_internal(double p, double lo, double hi) {
+    double span = hi - lo;
+    if (!(span > 0.0)) {
+      return 0.0;
+    }
+    double frac = (p - lo) / span;
+    // Keep strictly inside, or the logit is infinite
+    const double eps = 1e-9;
+    frac = std::min(std::max(frac, eps), 1.0 - eps);
+    return std::log(frac / (1.0 - frac));
+  }
+
+  inline double internal_to_bounded(double u, double lo, double hi) {
+    double span = hi - lo;
+    if (!(span > 0.0)) {
+      return lo;
+    }
+    // Logistic, written to avoid overflow for either sign of u
+    double frac;
+    if (u >= 0.0) {
+      frac = 1.0 / (1.0 + std::exp(-u));
+    } else {
+      double e = std::exp(u);
+      frac = e / (1.0 + e);
+    }
+    return lo + span * frac;
+  }
+
   struct IBIXProfileFunctor {
     scitbx::af::const_ref<double> tof;
     scitbx::af::const_ref<double> y_norm;  // Assumed normalized
@@ -178,24 +222,27 @@ namespace dials { namespace algorithms {
       return num_params;
     }
 
-    inline Eigen::VectorXd clamp_params(const Eigen::VectorXd& x) const {
-      Eigen::VectorXd xc = x;
-      for (int i = 0; i < x.size(); ++i) {
-        xc[i] = std::min(std::max(x[i], min_bounds[i]), max_bounds[i]);
+    // The optimiser's vector is internal; these convert to and from parameters
+    Eigen::VectorXd to_internal(const Eigen::VectorXd& p) const {
+      Eigen::VectorXd u(num_params);
+      for (int i = 0; i < num_params; ++i) {
+        u[i] = bounded_to_internal(p[i], min_bounds[i], max_bounds[i]);
       }
-      return xc;
+      return u;
     }
 
-    int operator()(const Eigen::VectorXd& x, Eigen::VectorXd& fvec) const {
-      Eigen::VectorXd xc = clamp_params(x);
-      double A = xc[0];
-      double alpha = xc[1];
-      double beta = xc[2];
-      double sigma = xc[3];
-      double T_ph = xc[4];
+    Eigen::VectorXd to_params(const Eigen::VectorXd& u) const {
+      Eigen::VectorXd p(num_params);
+      for (int i = 0; i < num_params; ++i) {
+        p[i] = internal_to_bounded(u[i], min_bounds[i], max_bounds[i]);
+      }
+      return p;
+    }
 
+    int operator()(const Eigen::VectorXd& u, Eigen::VectorXd& fvec) const {
+      Eigen::VectorXd x = to_params(u);
       scitbx::af::shared<double> model =
-        profile1d_func(tof, A, alpha, beta, sigma, T_ph);
+        profile1d_func(tof, x[0], x[1], x[2], x[3], x[4]);
       assert(model.size() == num_data_points);
       for (int i = 0; i < num_data_points; ++i) {
         fvec[i] = y_norm[i] - model[i];
@@ -203,33 +250,22 @@ namespace dials { namespace algorithms {
       return 0;
     }
 
-    int df(const Eigen::VectorXd& x, Eigen::MatrixXd& J) const {
+    int df(const Eigen::VectorXd& u, Eigen::MatrixXd& J) const {
+      // Central differences in the internal variable, where every step is
+      // feasible and no clamping can flatten a column
       const double eps = 1e-5;
-      Eigen::VectorXd xc = clamp_params(x);
       J.resize(num_data_points, num_params);
 
       for (int j = 0; j < num_params; ++j) {
-        // Perturb param
-        double delta = eps * std::max(1.0, std::abs(xc[j]));
-        Eigen::VectorXd xp = xc, xm = xc;
-        xp[j] += delta;
-        xm[j] -= delta;
-
-        Eigen::VectorXd xpc = clamp_params(xp);
-        Eigen::VectorXd xmc = clamp_params(xm);
-
-        double step = xpc[j] - xmc[j];
-        if (std::abs(step) < 1e-14) {
-          J.col(j).setZero();
-          continue;
-        }
+        double delta = eps * std::max(1.0, std::abs(u[j]));
+        Eigen::VectorXd up = u, um = u;
+        up[j] += delta;
+        um[j] -= delta;
 
         Eigen::VectorXd fp(num_data_points), fm(num_data_points);
-        operator()(xpc, fp);
-        operator()(xmc, fm);
-
-        // Central difference
-        J.col(j) = (fp - fm) / step;
+        operator()(up, fp);
+        operator()(um, fm);
+        J.col(j) = (fp - fm) / (2.0 * delta);
       }
 
       return 0;
@@ -278,48 +314,46 @@ namespace dials { namespace algorithms {
       return num_params;
     }
 
-    inline Eigen::VectorXd clamp_params(const Eigen::VectorXd& x) const {
-      Eigen::VectorXd xc = x;
-      for (int i = 0; i < x.size(); ++i) {
-        xc[i] = std::min(std::max(x[i], min_bounds[i]), max_bounds[i]);
+    Eigen::VectorXd to_internal(const Eigen::VectorXd& p) const {
+      Eigen::VectorXd u(num_params);
+      for (int i = 0; i < num_params; ++i) {
+        u[i] = bounded_to_internal(p[i], min_bounds[i], max_bounds[i]);
       }
-      return xc;
+      return u;
     }
 
-    int operator()(const Eigen::VectorXd& x, Eigen::VectorXd& fvec) const {
-      Eigen::VectorXd xc = clamp_params(x);
+    Eigen::VectorXd to_params(const Eigen::VectorXd& u) const {
+      Eigen::VectorXd p(num_params);
+      for (int i = 0; i < num_params; ++i) {
+        p[i] = internal_to_bounded(u[i], min_bounds[i], max_bounds[i]);
+      }
+      return p;
+    }
+
+    int operator()(const Eigen::VectorXd& u, Eigen::VectorXd& fvec) const {
+      Eigen::VectorXd x = to_params(u);
       scitbx::af::shared<double> model =
-        profile1d_func(tof, xc[0], alpha, beta, sigma, xc[1]);
+        profile1d_func(tof, x[0], alpha, beta, sigma, x[1]);
       for (int i = 0; i < num_data_points; ++i) {
         fvec[i] = y_norm[i] - model[i];
       }
       return 0;
     }
 
-    int df(const Eigen::VectorXd& x, Eigen::MatrixXd& J) const {
+    int df(const Eigen::VectorXd& u, Eigen::MatrixXd& J) const {
       const double eps = 1e-5;
-      Eigen::VectorXd xc = clamp_params(x);
       J.resize(num_data_points, num_params);
 
       for (int j = 0; j < num_params; ++j) {
-        double delta = eps * std::max(1.0, std::abs(xc[j]));
-        Eigen::VectorXd xp = xc, xm = xc;
-        xp[j] += delta;
-        xm[j] -= delta;
-
-        Eigen::VectorXd xpc = clamp_params(xp);
-        Eigen::VectorXd xmc = clamp_params(xm);
-
-        double step = xpc[j] - xmc[j];
-        if (std::abs(step) < 1e-14) {
-          J.col(j).setZero();
-          continue;
-        }
+        double delta = eps * std::max(1.0, std::abs(u[j]));
+        Eigen::VectorXd up = u, um = u;
+        up[j] += delta;
+        um[j] -= delta;
 
         Eigen::VectorXd fp(num_data_points), fm(num_data_points);
-        operator()(xpc, fp);
-        operator()(xmc, fm);
-        J.col(j) = (fp - fm) / step;
+        operator()(up, fp);
+        operator()(um, fm);
+        J.col(j) = (fp - fm) / (2.0 * delta);
       }
 
       return 0;
@@ -339,6 +373,7 @@ namespace dials { namespace algorithms {
     double fwhm_smoothing_window;
     double trust_min_corr;
     double trust_peak_tolerance;
+    double trust_peak_height_fraction;
     std::array<double, 5> min_bounds;
     std::array<double, 5> max_bounds;
 
@@ -354,7 +389,8 @@ namespace dials { namespace algorithms {
                      int n_restarts_,
                      double fwhm_smoothing_window_,
                      double trust_min_corr_,
-                     double trust_peak_tolerance_)
+                     double trust_peak_tolerance_,
+                     double trust_peak_height_fraction_)
         : tof(tof_),
           intensities(intensities_),
           A(A_),
@@ -365,6 +401,7 @@ namespace dials { namespace algorithms {
           fwhm_smoothing_window(fwhm_smoothing_window_),
           trust_min_corr(trust_min_corr_),
           trust_peak_tolerance(trust_peak_tolerance_),
+          trust_peak_height_fraction(trust_peak_height_fraction_),
           n_restarts(n_restarts_) {
       DIALS_ASSERT(tof.size() > 0);
       DIALS_ASSERT(tof.size() == intensities.size());
@@ -518,6 +555,36 @@ namespace dials { namespace algorithms {
       return sigma0;
     }
 
+    /*
+     * The tallest channel of the data is a poor thing to compare a smooth model
+     * against: it is the maximum of as many samples as there are bins, so the
+     * finer the slicing the further it sits above the curve it is drawn from.
+     * Smoothing over the same fixed time used to seed sigma gives a peak height
+     * that does not depend on the bin width.
+     */
+    double smoothed_data_peak() const {
+      const int n = static_cast<int>(y_norm.size());
+      if (n == 0) {
+        return 0.0;
+      }
+      double mean_dt = (tof.back() - tof.front()) / std::max(n - 1, 1);
+      int half_window = static_cast<int>(0.5 * fwhm_smoothing_window / mean_dt);
+      if (half_window < 1) {
+        return *std::max_element(y_norm.begin(), y_norm.end());
+      }
+      double best = 0.0;
+      for (int i = 0; i < n; ++i) {
+        int lo = std::max(0, i - half_window);
+        int hi = std::min(n - 1, i + half_window);
+        double total = 0.0;
+        for (int j = lo; j <= hi; ++j) {
+          total += y_norm[j];
+        }
+        best = std::max(best, total / (hi - lo + 1));
+      }
+      return best;
+    }
+
     double calc_intensity() const {
       /**
        * Get overall intensity with Simpsons rule then divide by mean_dt to
@@ -567,15 +634,15 @@ namespace dials { namespace algorithms {
         lm.parameters.xtol = xtol;
         lm.parameters.ftol = ftol;
 
-        Eigen::VectorXd x = x_init;
-        int result = lm.minimize(x);
+        Eigen::VectorXd u = functor.to_internal(x_init);
+        int result = lm.minimize(u);
         if (result < 0) return false;
 
-        x = functor.clamp_params(x);
+        Eigen::VectorXd x = functor.to_params(u);
 
-        // Compute residual norm
+        // Compute residual norm (the functor takes internal variables)
         Eigen::VectorXd fvec(functor.num_data_points);
-        functor(x, fvec);
+        functor(u, fvec);
         final_error = fvec.squaredNorm();
 
         // Update fitted parameters
@@ -598,6 +665,7 @@ namespace dials { namespace algorithms {
 
       if (success) {
         I_prf = this->calc_intensity();
+        max_profile_index = this->get_max_profile_index();
         if (this->trust_result(fit_resid,
                                I_prf,
                                max_sum_index,
@@ -721,13 +789,21 @@ namespace dials { namespace algorithms {
         return false;
       }
 
-      // Check peak height is within 10% of data peak
-      double peak_diff = std::abs(profile_peak - data_peak);
-      if (peak_diff > data_peak * 0.1) {
+      /*
+       * Check the peak height against the data, measured on a smoothed copy so
+       * that the comparison is with the curve rather than with its noisiest
+       * channel, and so that it does not tighten as the slices get finer.
+       */
+      double smooth_peak = smoothed_data_peak();
+      double reference_peak = std::max(smooth_peak, 1e-12);
+      double peak_diff = std::abs(profile_peak - reference_peak);
+      if (peak_diff > reference_peak * trust_peak_height_fraction) {
         if (show_error) {
           std::cerr << "profile1d fitting failure: peak height mismatch "
-                    << "(profile_peak=" << profile_peak << ", data_peak=" << data_peak
-                    << ", diff=" << peak_diff << ")\n";
+                    << "(profile_peak=" << profile_peak
+                    << ", data_peak=" << reference_peak
+                    << ", raw_data_peak=" << data_peak << ", diff=" << peak_diff
+                    << ")\n";
         }
         return false;
       }
@@ -775,7 +851,8 @@ namespace dials { namespace algorithms {
                              profile_params.n_restarts,
                              profile_params.fwhm_smoothing_window,
                              profile_params.trust_min_corr,
-                             profile_params.trust_peak_tolerance);
+                             profile_params.trust_peak_tolerance,
+                             profile_params.trust_peak_height_fraction);
 
     bool profile_success = true;
     if (profile_params.optimize_profile) {
@@ -881,10 +958,11 @@ namespace dials { namespace algorithms {
     lm.parameters.maxfev = 200;
     lm.parameters.xtol = 1e-8;
     lm.parameters.ftol = 1e-8;
-    if (lm.minimize(x) < 0) {
+    Eigen::VectorXd u = functor.to_internal(x);
+    if (lm.minimize(u) < 0) {
       return false;
     }
-    x = functor.clamp_params(x);
+    x = functor.to_params(u);
 
     scitbx::af::shared<double> model =
       profile1d_func(tof_z, x[0], shape.alpha, shape.beta, shape.sigma, x[1]);

@@ -195,6 +195,12 @@ profile_1d_ibix{
                 "of the data before the fit is rejected. A time rather than a"
                 "number of bins, so the tolerance does not shrink as the slices"
                 "get finer. 300 us matches the previous fixed 3 bins at 101 us."
+    peak_height_fraction = 0.1
+        .type = float(value_min=0)
+        .help = "Allowed relative difference between the fitted peak height and"
+                "the height of the smoothed data. Measured against the smoothed"
+                "curve rather than the tallest channel, which on finely sliced"
+                "data is a noise outlier no correct fit can reach."
     library{
         enable = False
             .type = bool
@@ -575,21 +581,27 @@ def integrate_reflection_table_for_experiment(
         min_beta = params.profile_1d_ibix.min_beta
         max_beta = params.profile_1d_ibix.max_beta
         n_restarts = params.profile_1d_ibix.n_restarts
+        # dict needed due to boost limit of 15 constructor arguments
         profile_1d_ibix_params = TOFProfile1DIBIXParams(
-            min_A,
-            max_A,
-            alpha,
-            min_alpha,
-            max_alpha,
-            beta,
-            min_beta,
-            max_beta,
-            n_restarts,
-            True,
-            show_profile_failures,
-            params.profile_1d_ibix.fwhm_smoothing_window,
-            params.profile_1d_ibix.min_correlation,
-            params.profile_1d_ibix.peak_tolerance,
+            {
+                "A_min": min_A,
+                "A_max": max_A,
+                "alpha": alpha,
+                "alpha_min": min_alpha,
+                "alpha_max": max_alpha,
+                "beta": beta,
+                "beta_min": min_beta,
+                "beta_max": max_beta,
+                "n_restarts": n_restarts,
+                "optimize_profile": True,
+                "show_profile_failures": show_profile_failures,
+                "fwhm_smoothing_window": params.profile_1d_ibix.fwhm_smoothing_window,
+                "trust_min_corr": params.profile_1d_ibix.min_correlation,
+                "trust_peak_tolerance": params.profile_1d_ibix.peak_tolerance,
+                "trust_peak_height_fraction": (
+                    params.profile_1d_ibix.peak_height_fraction
+                ),
+            }
         )
     elif params.method == "profile_1d_ic":
         p = params.profile_1d_ic

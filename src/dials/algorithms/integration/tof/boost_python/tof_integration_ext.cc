@@ -61,6 +61,27 @@ namespace dials { namespace algorithms { namespace boost_python {
   // TOFProfile1DICParams (15 constructor arguments) and TOFProfile3DICParams
   // (24 constructor arguments) are constructed from a single Python dict
   // instead.
+  std::shared_ptr<TOFProfile1DIBIXParams> make_TOFProfile1DIBIXParams(dict params) {
+    auto d = [&](const char* key) { return extract<double>(params[key])(); };
+    auto i = [&](const char* key) { return extract<int>(params[key])(); };
+    auto b = [&](const char* key) { return extract<bool>(params[key])(); };
+    return std::make_shared<TOFProfile1DIBIXParams>(d("A_min"),
+                                                    d("A_max"),
+                                                    d("alpha"),
+                                                    d("alpha_min"),
+                                                    d("alpha_max"),
+                                                    d("beta"),
+                                                    d("beta_min"),
+                                                    d("beta_max"),
+                                                    i("n_restarts"),
+                                                    b("optimize_profile"),
+                                                    b("show_profile_failures"),
+                                                    d("fwhm_smoothing_window"),
+                                                    d("trust_min_corr"),
+                                                    d("trust_peak_tolerance"),
+                                                    d("trust_peak_height_fraction"));
+  }
+
   std::shared_ptr<TOFProfile1DICParams> make_TOFProfile1DICParams(dict params) {
     auto d = [&](const char* key) { return extract<double>(params[key])(); };
     auto i = [&](const char* key) { return extract<int>(params[key])(); };
@@ -378,20 +399,7 @@ namespace dials { namespace algorithms { namespace boost_python {
 
   BOOST_PYTHON_MODULE(dials_algorithms_tof_integration_ext) {
     class_<TOFProfile1DIBIXParams>("TOFProfile1DIBIXParams", no_init)
-      .def(init<double,
-                double,
-                double,
-                double,
-                double,
-                double,
-                double,
-                double,
-                int,
-                bool,
-                bool,
-                double,
-                double,
-                double>())
+      .def("__init__", make_constructor(&make_TOFProfile1DIBIXParams))
       .def_readwrite("A", &TOFProfile1DIBIXParams::A)
       .def_readwrite("A_min", &TOFProfile1DIBIXParams::A_min)
       .def_readwrite("A_max", &TOFProfile1DIBIXParams::A_max)
@@ -409,7 +417,9 @@ namespace dials { namespace algorithms { namespace boost_python {
                      &TOFProfile1DIBIXParams::fwhm_smoothing_window)
       .def_readwrite("trust_min_corr", &TOFProfile1DIBIXParams::trust_min_corr)
       .def_readwrite("trust_peak_tolerance",
-                     &TOFProfile1DIBIXParams::trust_peak_tolerance);
+                     &TOFProfile1DIBIXParams::trust_peak_tolerance)
+      .def_readwrite("trust_peak_height_fraction",
+                     &TOFProfile1DIBIXParams::trust_peak_height_fraction);
 
     class_<TOFProfile1DICParams, std::shared_ptr<TOFProfile1DICParams>>(
       "TOFProfile1DICParams", no_init)
