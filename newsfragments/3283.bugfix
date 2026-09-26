@@ -1,0 +1,1 @@
+``dials.tof_integrate``: seed the ``profile_1d_ibix`` peak width from a fixed time window rather than a fixed number of ToF bins, so that finely sliced data is not fitted with a starting width pinned to the bin width.
