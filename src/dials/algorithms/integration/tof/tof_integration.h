@@ -24,6 +24,10 @@
 #include <dials/algorithms/integration/tof/tof_profile_3d_ibix.h>
 #include <dials/algorithms/scaling/tof/tof_scaling.h>
 #include <dials/util/thread_pool.h>
+#include <atomic>
+#include <chrono>
+#include <iostream>
+#include <thread>
 
 namespace dials { namespace algorithms {
 
@@ -632,9 +636,14 @@ namespace dials { namespace algorithms {
       variances_prf.resize(reflection_table.size());
     }
 
+    // Progress counters, so that a long fit reports something while it runs
+    std::atomic<std::size_t> n_done(0);
+    std::atomic<std::size_t> n_prf_ok(0);
+
     auto worker = [&](std::size_t start, std::size_t end) {
       for (std::size_t i = start; i < end; ++i) {
         if (refl_flags[i] & dials::af::DontIntegrate) {
+          ++n_done;
           continue;
         }
         Shoebox<> shoebox = shoeboxes[i];
@@ -684,7 +693,11 @@ namespace dials { namespace algorithms {
             variances_prf[i] = var_prf;
           }
           succeeded_prf[i] = profile_success;
+          if (profile_success) {
+            ++n_prf_ok;
+          }
         }
+        ++n_done;
       }
     };
 
@@ -699,7 +712,39 @@ namespace dials { namespace algorithms {
       pool.post([=]() { worker(start, end); });
     }
 
+    /*
+     * Report progress every few seconds while the pool drains.  Profile
+     * fitting a large table can take many minutes with nothing else to show
+     * that it is making progress, and the running fit fraction says early on
+     * whether the chosen method is working at all.
+     */
+    std::atomic<bool> pool_finished(false);
+    std::thread reporter([&]() {
+      const auto interval = std::chrono::seconds(10);
+      auto next = std::chrono::steady_clock::now() + interval;
+      while (!pool_finished.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (std::chrono::steady_clock::now() < next) {
+          continue;
+        }
+        next += interval;
+        std::size_t done = n_done.load();
+        if (done == 0 || done >= n_reflections) {
+          continue;
+        }
+        std::cout << "      " << done << " / " << n_reflections << " reflections ("
+                  << (100 * done / n_reflections) << " %)";
+        if (profile_fitter) {
+          std::cout << ", profile fitted " << n_prf_ok.load() << " ("
+                    << (100 * n_prf_ok.load() / done) << " % so far)";
+        }
+        std::cout << std::endl;
+      }
+    });
+
     pool.wait();
+    pool_finished.store(true);
+    reporter.join();
 
     reflection_table["intensity.sum.value"] = intensities;
     reflection_table["intensity.sum.variance"] = variances;
