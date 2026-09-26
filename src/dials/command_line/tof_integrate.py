@@ -182,6 +182,37 @@ profile_1d_ibix{
                 "full width at half maximum is measured to seed sigma. A fixed"
                 "time rather than a fixed number of bins, so that the seed does"
                 "not depend on the ToF bin width. Set to 0 to disable."
+    min_correlation = 0.9
+        .type = float(value_min=0, value_max=1)
+        .help = "Correlation a fitted profile must reach with the projection for"
+                "its intensity to be accepted. Note this rewards a fit that"
+                "follows the noise, and is close to unreachable on finely"
+                "sliced data, where a peak spans tens of points rather than a"
+                "few."
+    peak_tolerance = 300.0
+        .type = float(value_min=0)
+        .help = "How far in us the fitted peak may sit from the tallest channel"
+                "of the data before the fit is rejected. A time rather than a"
+                "number of bins, so the tolerance does not shrink as the slices"
+                "get finer. 300 us matches the previous fixed 3 bins at 101 us."
+    library{
+        enable = False
+            .type = bool
+            .help = "Measure the peak shape on strong reflections, then hold it"
+                    "fixed and fit only the amplitude and position everywhere"
+                    "else, as Mantid's IntegratePeaksProfileFitting does. A weak"
+                    "reflection has too few counts to determine its own shape."
+                    "Requires two passes over the reflection table."
+        min_i_sigma = 5.0
+            .type = float(value_min=0)
+            .help = "Summation I/sigma a reflection must reach for its fitted"
+                    "shape to enter the library."
+        min_correlation = 0.5
+            .type = float(value_min=0, value_max=1)
+            .help = "Correlation a free fit must reach for its shape to enter"
+                    "the library. Looser than min_correlation, because a shape"
+                    "only has to be the right shape."
+    }
 
 }
 profile_1d_ic{
@@ -517,6 +548,17 @@ def integrate_reflection_table_for_experiment(
 
     logger.info(f"    Integrating using {params.method}")
 
+    library_min_i_sigma = -1.0
+    library_min_corr = 0.5
+    if params.method == "profile_1d_ibix" and params.profile_1d_ibix.library.enable:
+        library_min_i_sigma = params.profile_1d_ibix.library.min_i_sigma
+        library_min_corr = params.profile_1d_ibix.library.min_correlation
+        logger.info(
+            "    Building a profile library from reflections with "
+            f"I/sigma >= {library_min_i_sigma} and fit correlation "
+            f">= {library_min_corr}"
+        )
+
     show_profile_failures = logger.getEffectiveLevel() == logging.DEBUG
     if params.method == "profile_1d_ibix":
         alpha = params.profile_1d_ibix.init_alpha
@@ -546,6 +588,8 @@ def integrate_reflection_table_for_experiment(
             True,
             show_profile_failures,
             params.profile_1d_ibix.fwhm_smoothing_window,
+            params.profile_1d_ibix.min_correlation,
+            params.profile_1d_ibix.peak_tolerance,
         )
     elif params.method == "profile_1d_ic":
         p = params.profile_1d_ic
@@ -677,6 +721,8 @@ def integrate_reflection_table_for_experiment(
         profile_3d_gutmann_params,
         profile_3d_ic_params,
         profile_3d_ibix_params,
+        library_min_i_sigma,
+        library_min_corr,
     )
 
     return expt_reflections

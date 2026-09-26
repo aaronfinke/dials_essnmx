@@ -19,7 +19,9 @@ namespace dials { namespace algorithms { namespace boost_python {
     object profile_1d_ic_params_obj,
     object profile_3d_gutmann_params_obj,
     object profile_3d_ic_params_obj,
-    object profile_3d_ibix_params_obj) {
+    object profile_3d_ibix_params_obj,
+    double library_min_i_sigma,
+    double library_min_corr) {
     // Only one profile fitting method allowed
     int n_given =
       !profile_1d_ibix_params_obj.is_none() + !profile_1d_ic_params_obj.is_none()
@@ -28,8 +30,12 @@ namespace dials { namespace algorithms { namespace boost_python {
     DIALS_ASSERT(n_given <= 1);
 
     if (!profile_1d_ibix_params_obj.is_none()) {
-      return std::make_shared<Profile1DIBIXFitter>(
-        extract<TOFProfile1DIBIXParams>(profile_1d_ibix_params_obj));
+      auto ibix_params = extract<TOFProfile1DIBIXParams>(profile_1d_ibix_params_obj)();
+      if (library_min_i_sigma > 0.0) {
+        return std::make_shared<Profile1DIBIXLibraryFitter>(
+          ibix_params, library_min_i_sigma, library_min_corr);
+      }
+      return std::make_shared<Profile1DIBIXFitter>(ibix_params);
     }
     if (!profile_1d_ic_params_obj.is_none()) {
       return std::make_shared<Profile1DICFitter>(
@@ -139,7 +145,9 @@ namespace dials { namespace algorithms { namespace boost_python {
                                           object profile_1d_ic_params_obj,
                                           object profile_3d_gutmann_params_obj,
                                           object profile_3d_ic_params_obj,
-                                          object profile_3d_ibix_params_obj) {
+                                          object profile_3d_ibix_params_obj,
+                                          double library_min_i_sigma,
+                                          double library_min_corr) {
     boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
     boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params;
 
@@ -157,7 +165,9 @@ namespace dials { namespace algorithms { namespace boost_python {
                           profile_1d_ic_params_obj,
                           profile_3d_gutmann_params_obj,
                           profile_3d_ic_params_obj,
-                          profile_3d_ibix_params_obj);
+                          profile_3d_ibix_params_obj,
+                          library_min_i_sigma,
+                          library_min_corr);
 
     integrate_reflection_table(reflection_table,
                                experiment,
@@ -379,6 +389,8 @@ namespace dials { namespace algorithms { namespace boost_python {
                 int,
                 bool,
                 bool,
+                double,
+                double,
                 double>())
       .def_readwrite("A", &TOFProfile1DIBIXParams::A)
       .def_readwrite("A_min", &TOFProfile1DIBIXParams::A_min)
@@ -394,7 +406,10 @@ namespace dials { namespace algorithms { namespace boost_python {
       .def_readwrite("show_profile_failures",
                      &TOFProfile1DIBIXParams::show_profile_failures)
       .def_readwrite("fwhm_smoothing_window",
-                     &TOFProfile1DIBIXParams::fwhm_smoothing_window);
+                     &TOFProfile1DIBIXParams::fwhm_smoothing_window)
+      .def_readwrite("trust_min_corr", &TOFProfile1DIBIXParams::trust_min_corr)
+      .def_readwrite("trust_peak_tolerance",
+                     &TOFProfile1DIBIXParams::trust_peak_tolerance);
 
     class_<TOFProfile1DICParams, std::shared_ptr<TOFProfile1DICParams>>(
       "TOFProfile1DICParams", no_init)
@@ -509,7 +524,9 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("profile_1d_ic_params") = object(),
          arg("profile_3d_gutmann_params") = object(),
          arg("profile_3d_ic_params") = object(),
-         arg("profile_3d_ibix_params") = object()));
+         arg("profile_3d_ibix_params") = object(),
+         arg("library_min_i_sigma") = -1.0,
+         arg("library_min_corr") = 0.5));
 
     def("calculate_line_profile_for_reflection",
         &calculate_line_profile_for_reflection_wrapper,
