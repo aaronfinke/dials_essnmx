@@ -482,6 +482,65 @@ namespace dials { namespace algorithms {
     IBIXShape shape;
   };
 
+  /*
+   * Variance of a profile-fitted intensity.
+   *
+   * With the shape held fixed the intensity is linear in the amplitude, so
+   * weighted least squares gives its error exactly: for data with per-slice
+   * variances v_i and a model m_i, var(I) = I^2 / sum(m_i^2 / v_i).
+   *
+   * The per-slice variances are not carried through the corrections, so they are
+   * taken as the summation variance distributed across the slices in proportion
+   * to counts plus twice background. That keeps the absolute scale tied to the
+   * summation variance, which is the one checked against the scatter of symmetry
+   * equivalents, while letting the profile do what it should: a slice the fitted
+   * peak says holds no signal stops contributing noise. The result is at most the
+   * summation variance and below it when the peak is concentrated, which is where
+   * copying the summation variance was overestimating sigma.
+   */
+  inline double profile_fit_variance(const ShoeboxIntegrationResult& shoebox_result,
+                                     const scitbx::af::shared<double>& model,
+                                     double I_prf) {
+    const std::size_t n = model.size();
+    if (n == 0 || !(shoebox_result.variance > 0.0) || !(I_prf > 0.0)) {
+      return 0.0;
+    }
+    if (shoebox_result.projected_intensity.size() != n
+        || shoebox_result.projected_background.size() != n) {
+      return 0.0;
+    }
+
+    double weight_total = 0.0;
+    scitbx::af::shared<double> weight(n, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+      double signal = std::max(shoebox_result.projected_intensity[i], 0.0);
+      double background = std::max(shoebox_result.projected_background[i], 0.0);
+      weight[i] = signal + 2.0 * background;
+      weight_total += weight[i];
+    }
+    if (!(weight_total > 0.0)) {
+      return 0.0;
+    }
+
+    double inv_sum = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      double v = shoebox_result.variance * weight[i] / weight_total;
+      if (!(v > 0.0) || !std::isfinite(model[i])) {
+        continue;
+      }
+      inv_sum += (model[i] * model[i]) / v;
+    }
+    if (!(inv_sum > 0.0)) {
+      return 0.0;
+    }
+    double var = (I_prf * I_prf) / inv_sum;
+    if (!std::isfinite(var) || var <= 0.0) {
+      return 0.0;
+    }
+    // Never claim to beat counting statistics over the whole box
+    return std::min(var, shoebox_result.variance);
+  }
+
   // Profile fitting strategy
   class ProfileFitter {
   public:
@@ -614,12 +673,24 @@ namespace dials { namespace algorithms {
       if (entry == nullptr) {
         return false;
       }
-      return fit_profile_1d_ibix_forced(shoebox_result.projected_intensity.const_ref(),
-                                        shoebox_result.tof_z.const_ref(),
-                                        entry->shape,
-                                        params_.A_min,
-                                        params_.A_max,
-                                        I_prf);
+      std::size_t n = shoebox_result.projected_intensity.size();
+      scitbx::af::shared<double> model(n, 0.0);
+      bool ok =
+        fit_profile_1d_ibix_forced(shoebox_result.projected_intensity.const_ref(),
+                                   shoebox_result.tof_z.const_ref(),
+                                   entry->shape,
+                                   params_.A_min,
+                                   params_.A_max,
+                                   I_prf,
+                                   model);
+      if (!ok) {
+        return false;
+      }
+      double fitted_var = profile_fit_variance(shoebox_result, model, I_prf);
+      if (fitted_var > 0.0) {
+        var_prf = fitted_var;
+      }
+      return true;
     }
 
     // Only reached if the library is empty
