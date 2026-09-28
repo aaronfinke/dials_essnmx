@@ -19,13 +19,19 @@ namespace dials { namespace algorithms { namespace boost_python {
     object profile_1d_ic_params_obj,
     object profile_3d_gutmann_params_obj,
     object profile_3d_ic_params_obj,
-    object profile_3d_ibix_params_obj) {
+    object profile_3d_ibix_params_obj,
+    object profile_1d_mantid_params_obj) {
     // Only one profile fitting method allowed
     int n_given =
       !profile_1d_ibix_params_obj.is_none() + !profile_1d_ic_params_obj.is_none()
       + !profile_3d_gutmann_params_obj.is_none() + !profile_3d_ic_params_obj.is_none()
-      + !profile_3d_ibix_params_obj.is_none();
+      + !profile_3d_ibix_params_obj.is_none() + !profile_1d_mantid_params_obj.is_none();
     DIALS_ASSERT(n_given <= 1);
+
+    if (!profile_1d_mantid_params_obj.is_none()) {
+      return std::make_shared<Profile1DMantidFitter>(
+        extract<TOFProfile1DMantidParams>(profile_1d_mantid_params_obj)());
+    }
 
     if (!profile_1d_ibix_params_obj.is_none()) {
       return std::make_shared<Profile1DIBIXFitter>(
@@ -55,6 +61,29 @@ namespace dials { namespace algorithms { namespace boost_python {
   // TOFProfile1DICParams (15 constructor arguments) and TOFProfile3DICParams
   // (24 constructor arguments) are constructed from a single Python dict
   // instead.
+  std::shared_ptr<TOFProfile1DMantidParams> make_TOFProfile1DMantidParams(dict params) {
+    auto d = [&](const char* key) { return extract<double>(params[key])(); };
+    auto i = [&](const char* key) { return extract<int>(params[key])(); };
+    auto b = [&](const char* key) { return extract<bool>(params[key])(); };
+    return std::make_shared<TOFProfile1DMantidParams>(d("A_min"),
+                                                      d("A_max"),
+                                                      d("alpha"),
+                                                      d("alpha_min"),
+                                                      d("alpha_max"),
+                                                      d("beta"),
+                                                      d("beta_min"),
+                                                      d("beta_max"),
+                                                      i("n_restarts"),
+                                                      b("optimize_profile"),
+                                                      b("show_profile_failures"),
+                                                      d("peak_height_smoothing"),
+                                                      d("trust_min_corr"),
+                                                      d("trust_peak_tolerance"),
+                                                      d("trust_peak_height_fraction"),
+                                                      d("library_min_i_sigma"),
+                                                      d("library_min_corr"));
+  }
+
   std::shared_ptr<TOFProfile1DICParams> make_TOFProfile1DICParams(dict params) {
     auto d = [&](const char* key) { return extract<double>(params[key])(); };
     auto i = [&](const char* key) { return extract<int>(params[key])(); };
@@ -139,7 +168,8 @@ namespace dials { namespace algorithms { namespace boost_python {
                                           object profile_1d_ic_params_obj,
                                           object profile_3d_gutmann_params_obj,
                                           object profile_3d_ic_params_obj,
-                                          object profile_3d_ibix_params_obj) {
+                                          object profile_3d_ibix_params_obj,
+                                          object profile_1d_mantid_params_obj) {
     boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
     boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params;
 
@@ -157,7 +187,8 @@ namespace dials { namespace algorithms { namespace boost_python {
                           profile_1d_ic_params_obj,
                           profile_3d_gutmann_params_obj,
                           profile_3d_ic_params_obj,
-                          profile_3d_ibix_params_obj);
+                          profile_3d_ibix_params_obj,
+                          profile_1d_mantid_params_obj);
 
     integrate_reflection_table(reflection_table,
                                experiment,
@@ -367,6 +398,12 @@ namespace dials { namespace algorithms { namespace boost_python {
   }
 
   BOOST_PYTHON_MODULE(dials_algorithms_tof_integration_ext) {
+    class_<TOFProfile1DMantidParams>("TOFProfile1DMantidParams", no_init)
+      .def("__init__", make_constructor(&make_TOFProfile1DMantidParams))
+      .def_readwrite("library_min_i_sigma",
+                     &TOFProfile1DMantidParams::library_min_i_sigma)
+      .def_readwrite("library_min_corr", &TOFProfile1DMantidParams::library_min_corr);
+
     class_<TOFProfile1DIBIXParams>("TOFProfile1DIBIXParams", no_init)
       .def(init<double,
                 double,
@@ -506,7 +543,8 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("profile_1d_ic_params") = object(),
          arg("profile_3d_gutmann_params") = object(),
          arg("profile_3d_ic_params") = object(),
-         arg("profile_3d_ibix_params") = object()));
+         arg("profile_3d_ibix_params") = object(),
+         arg("profile_1d_mantid_params") = object()));
 
     def("calculate_line_profile_for_reflection",
         &calculate_line_profile_for_reflection_wrapper,
