@@ -485,6 +485,17 @@ namespace dials { namespace af { namespace boost_python {
     const af::const_ref<FloatType, af::c_grid<3> >& data,
     FloatType max_value,
     std::size_t first_max) {
+    // centroid_all asserts that the pixels sum to something positive rather
+    // than returning a non-finite centroid, so an all-zero shoebox (every pixel
+    // tied at zero) must be caught before it is called.
+    double total = 0.0;
+    for (std::size_t j = 0; j < data.size(); ++j) {
+      total += data[j];
+    }
+    if (!(total > 0.0)) {
+      return first_max;
+    }
+
     // Intensity-weighted centroid of the shoebox, in global pixel coordinates.
     vec3<double> c = shoebox.centroid_all().px.position;
     if (!std::isfinite(c[0]) || !std::isfinite(c[1]) || !std::isfinite(c[2])) {
