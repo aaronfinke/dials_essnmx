@@ -172,6 +172,22 @@ def test_peak_coordinates_ties_resolved_by_centroid():
     assert peak[0] == (5 + 0.5, 5 + 0.5, 0 + 0.5)
 
 
+def test_peak_coordinates_empty_shoebox():
+    from dials.array_family import flex
+    from dials.model.data import Shoebox
+
+    # An all-zero shoebox ties every pixel at the maximum, and has no centroid
+    # to break the tie with. It must fall back to the first pixel rather than
+    # failing the centroid's DIALS_ASSERT(sum_pixels_ > 0).
+    bbox = (10, 14, 20, 24, 30, 34)
+    shoebox = flex.shoebox(1)
+    shoebox[0] = Shoebox(bbox)
+    shoebox[0].allocate_data()
+
+    peak = shoebox.peak_coordinates()
+    assert peak[0] == (10 + 0.5, 20 + 0.5, 30 + 0.5)
+
+
 def test_bounding_boxes():
     from dials.array_family import flex
     from dials.model.data import Shoebox
