@@ -1,0 +1,1 @@
+``dials.tof_integrate``: no longer fails in ``peak_coordinates`` on a shoebox with no counts.
