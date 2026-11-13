@@ -340,11 +340,30 @@ namespace dials { namespace algorithms {
         // Keep track of which pixels are selected
         std::set<std::size_t> selected_pixels;
 
-        // Initial seed
-        auto max_it = std::max_element(data.begin(), data.end());
-        DIALS_ASSERT(max_it != data.end());  // data empty
-        float max_val = *max_it;
-        std::size_t max_idx = std::distance(data.begin(), max_it);
+        // Initial seed. Voxels flagged Overlapped belong to a neighbouring
+        // reflection and cannot seed this one, or a stronger neighbour inside
+        // the box would capture the mask. Growth is not restricted: a
+        // foreground that reaches an Overlapped voxel is a real overlap, and
+        // is left to be detected as one.
+        DIALS_ASSERT(data.size() > 0);  // data empty
+        bool have_seed = false;
+        std::size_t max_idx = 0;
+        for (std::size_t idx = 0; idx < data.size(); ++idx) {
+          if ((mask[idx] & dials::model::Overlapped) != 0) {
+            continue;
+          }
+          if (!have_seed || data[idx] > data[max_idx]) {
+            max_idx = idx;
+            have_seed = true;
+          }
+        }
+        if (!have_seed) {
+          for (std::size_t idx = 0; idx < mask.size(); ++idx) {
+            mask[idx] &= ~(Foreground | Background);
+            mask[idx] |= Background;
+          }
+          continue;
+        }
         selected_pixels.insert(max_idx);
 
         float skewness = calculate_skewness(data, selected_pixels);
@@ -484,6 +503,20 @@ namespace dials { namespace algorithms {
                          unit_s0,
                          sample_to_source_distance,
                          setting_rotation);
+
+        /*
+         * Voxels flagged Overlapped belong to a neighbouring reflection. They
+         * carry no weight in the ellipsoid and cannot be its centre, or a
+         * stronger neighbour inside the box would capture the mask. The
+         * labelling below still covers every voxel, so a foreground that
+         * reaches an Overlapped voxel is left to be detected as a real
+         * overlap. Same (z, y, x) order as get_shoebox_rlps.
+         */
+        for (std::size_t idx = 0; idx < shoebox_values.size(); ++idx) {
+          if ((mask[idx] & dials::model::Overlapped) != 0) {
+            shoebox_values[idx] = 0.0;
+          }
+        }
 
         /*
          * If there are no foreground counts in the ellipse,
