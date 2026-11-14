@@ -248,20 +248,16 @@ namespace dials { namespace algorithms { namespace boost_python {
 
   /*
    * One weighted solve for the intensities of a cluster, from a dense matrix
-   * of profiles (voxels by reflections). Returns the posterior values and
-   * variances, then the values and variances from the data alone, whose
-   * variances are -1 where the data do not determine them.
+   * of profiles (voxels by reflections). Returns the values and their
+   * variances; every variance is -1 if the data do not determine them.
    */
   boost::python::tuple fit_overlap_cluster_wrapper(
     scitbx::af::const_ref<double, scitbx::af::c_grid<2>> profiles,
     scitbx::af::const_ref<double> data,
-    scitbx::af::const_ref<double> variance,
-    scitbx::af::const_ref<double> prior_value,
-    scitbx::af::const_ref<double> prior_variance) {
+    scitbx::af::const_ref<double> variance) {
     const std::size_t n = profiles.accessor()[0];
     const std::size_t K = profiles.accessor()[1];
     DIALS_ASSERT(data.size() == n && variance.size() == n);
-    DIALS_ASSERT(prior_value.size() == K && prior_variance.size() == K);
 
     OverlapClusterDesign design;
     design.n_components = static_cast<int>(K);
@@ -273,30 +269,19 @@ namespace dials { namespace algorithms { namespace boost_python {
       }
       design.end_row();
     }
-    Eigen::VectorXd mu(K), tau2(K);
-    for (std::size_t k = 0; k < K; ++k) {
-      mu[k] = prior_value[k];
-      tau2[k] = prior_variance[k];
-    }
     OverlapClusterFit fit =
       solve_overlap_cluster(design,
                             std::vector<double>(data.begin(), data.end()),
-                            std::vector<double>(variance.begin(), variance.end()),
-                            mu,
-                            tau2);
-    DIALS_ASSERT(fit.success);
+                            std::vector<double>(variance.begin(), variance.end()));
 
-    scitbx::af::shared<double> value(K), value_variance(K);
-    scitbx::af::shared<double> ml_value(K, 0.0), ml_variance(K, -1.0);
-    for (std::size_t k = 0; k < K; ++k) {
-      value[k] = fit.value[k];
-      value_variance[k] = fit.covariance(k, k);
-      if (fit.ml_success) {
-        ml_value[k] = fit.ml_value[k];
-        ml_variance[k] = fit.ml_variance[k];
+    scitbx::af::shared<double> value(K, 0.0), value_variance(K, -1.0);
+    if (fit.success) {
+      for (std::size_t k = 0; k < K; ++k) {
+        value[k] = fit.value[k];
+        value_variance[k] = fit.covariance(k, k);
       }
     }
-    return boost::python::make_tuple(value, value_variance, ml_value, ml_variance);
+    return boost::python::make_tuple(value, value_variance);
   }
 
   // The coupled pairs as two parallel arrays of reflection indices
@@ -665,11 +650,7 @@ namespace dials { namespace algorithms { namespace boost_python {
 
     def("fit_overlap_cluster",
         &fit_overlap_cluster_wrapper,
-        (arg("profiles"),
-         arg("data"),
-         arg("variance"),
-         arg("prior_value"),
-         arg("prior_variance")));
+        (arg("profiles"), arg("data"), arg("variance")));
 
     def("tof_assign_overlap_ownership",
         &tof_assign_overlap_ownership,
