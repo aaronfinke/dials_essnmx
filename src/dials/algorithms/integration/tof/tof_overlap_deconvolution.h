@@ -31,16 +31,9 @@
  * broadened by the scatter of observed about predicted positions that the
  * library measured (see Profile1DProfilelibFitter::local_peak_model).
  *
- * When two peaks overlap closely the data alone separate them poorly, so each
- * intensity may also be given a Gaussian prior (mu_k, tau_k^2), taken from the
- * symmetry equivalents of the reflection that were measured without overlap.
- * The posterior is then Gaussian too:
+ *     a = (P^T W P)^-1 P^T W d,  cov(a) = (P^T W P)^-1
  *
- *     a = (P^T W P + L)^-1 (P^T W d + L mu),  cov(a) = (P^T W P + L)^-1
- *
- * with W the inverse voxel variances and L = diag(1 / tau_k^2). The solution
- * without the prior is reported beside it wherever the data determine it, so
- * that how far the prior moved each intensity can be seen.
+ * with W the inverse voxel variances.
  */
 
 namespace dials { namespace algorithms {
@@ -84,12 +77,8 @@ namespace dials { namespace algorithms {
 
   struct OverlapClusterFit {
     bool success = false;
-    Eigen::VectorXd value;          // posterior mean
-    Eigen::MatrixXd covariance;     // posterior covariance
-    bool ml_success = false;        // whether the data alone determine every intensity
-    Eigen::VectorXd ml_value;       // the solution without the prior
-    Eigen::VectorXd ml_variance;    // and its variance
-    Eigen::MatrixXd ml_covariance;  // and the full covariance
+    Eigen::VectorXd value;       // intensities
+    Eigen::MatrixXd covariance;  // their covariance
   };
 
   namespace detail {
@@ -125,26 +114,20 @@ namespace dials { namespace algorithms {
    * @param data The background-subtracted value of each voxel
    * @param variance The variance of each voxel; one that is not positive and
    * finite drops the voxel
-   * @param prior_value The prior mean of each intensity
-   * @param prior_variance Its variance; not positive means no prior
    */
-  inline OverlapClusterFit solve_overlap_cluster(
-    const OverlapClusterDesign& design,
-    const std::vector<double>& data,
-    const std::vector<double>& variance,
-    const Eigen::VectorXd& prior_value,
-    const Eigen::VectorXd& prior_variance) {
+  inline OverlapClusterFit solve_overlap_cluster(const OverlapClusterDesign& design,
+                                                 const std::vector<double>& data,
+                                                 const std::vector<double>& variance) {
     const int K = design.n_components;
     DIALS_ASSERT(data.size() == design.n_voxels());
     DIALS_ASSERT(variance.size() == design.n_voxels());
-    DIALS_ASSERT(prior_value.size() == K && prior_variance.size() == K);
 
     OverlapClusterFit fit;
     if (K == 0) {
       return fit;
     }
 
-    // Normal equations of the data alone
+    // Normal equations
     Eigen::MatrixXd M = Eigen::MatrixXd::Zero(K, K);
     Eigen::VectorXd b = Eigen::VectorXd::Zero(K);
     for (std::size_t i = 0; i < design.n_voxels(); ++i) {
@@ -162,30 +145,11 @@ namespace dials { namespace algorithms {
       }
     }
 
-    // The data alone
-    Eigen::MatrixXd M_inverse;
-    if (detail::invert_spd(M, 1e-10, M_inverse)) {
-      fit.ml_success = true;
-      fit.ml_value = M_inverse * b;
-      fit.ml_variance = M_inverse.diagonal();
-      fit.ml_covariance = M_inverse;
-    }
-
-    // With the prior
-    Eigen::MatrixXd M_post = M;
-    Eigen::VectorXd b_post = b;
-    for (int k = 0; k < K; ++k) {
-      if (prior_variance[k] > 0.0 && std::isfinite(prior_variance[k])
-          && std::isfinite(prior_value[k])) {
-        M_post(k, k) += 1.0 / prior_variance[k];
-        b_post[k] += prior_value[k] / prior_variance[k];
-      }
-    }
     Eigen::MatrixXd covariance;
-    if (!detail::invert_spd(M_post, 1e-12, covariance)) {
+    if (!detail::invert_spd(M, 1e-12, covariance)) {
       return fit;
     }
-    fit.value = covariance * b_post;
+    fit.value = covariance * b;
     fit.covariance = covariance;
     fit.success = fit.value.allFinite();
     return fit;
@@ -297,13 +261,10 @@ namespace dials { namespace algorithms {
    * Fits every cluster of overlapped reflections jointly and writes the
    * result to the table.
    *
-   * Reads overlap.cluster_id (negative: not in a cluster) and the prior
-   * overlap.prior.value / overlap.prior.variance (variance not positive: no
-   * prior). Writes, for every member of a fitted cluster,
-   * overlap.fit.value / overlap.fit.variance (the posterior) and
-   * overlap.ml.value / overlap.ml.variance (the data alone; variance -1 where
-   * the data do not determine it). A member flagged OverlappedFg, which could
-   * not be integrated on its own, also takes the posterior as its
+   * Reads overlap.cluster_id (negative: not in a cluster). Writes, for every
+   * member of a fitted cluster, overlap.fit.value / overlap.fit.variance
+   * (variance -1 for a reflection not fitted). A member flagged OverlappedFg,
+   * which could not be integrated on its own, also takes the fit as its
    * profile-fitted intensity. A member that was integrated on its own keeps
    * that intensity; its joint fit is there to be compared with it.
    *
@@ -335,12 +296,11 @@ namespace dials { namespace algorithms {
    * Scale: a profile fitted in 3D and one fitted to the ToF projection do not
    * measure quite the same quantity, because they extrapolate the tails of a
    * peak differently. intensity_scale is the ratio of the first to the second,
-   * as measured on reflections that can be fitted both ways. Priors are
-   * multiplied by it going in and results divided by it coming out, so that
-   * everything in the table stays on the scale of the other profile-fitted
-   * intensities.
+   * as measured on reflections that can be fitted both ways. Results are
+   * divided by it, so that everything in the table stays on the scale of the
+   * other profile-fitted intensities.
    *
-   * replace_all: every member of a cluster takes the posterior as its
+   * replace_all: every member of a cluster takes the fit as its
    * profile-fitted intensity, whether or not it was overlapped, and a member
    * of a cluster that could not be fitted loses its profile-fitted intensity.
    * Used to fit every reflection with this one model (an unoverlapped one as a
@@ -374,9 +334,6 @@ namespace dials { namespace algorithms {
     dials::af::const_ref<vec3<double> > xyzcal_px = reflection_table["xyzcal.px"];
     dials::af::const_ref<double> tof_cal = reflection_table["tof_cal"];
     dials::af::const_ref<int> cluster_id = reflection_table["overlap.cluster_id"];
-    dials::af::const_ref<double> prior_value = reflection_table["overlap.prior.value"];
-    dials::af::const_ref<double> prior_variance =
-      reflection_table["overlap.prior.variance"];
     dials::af::shared<std::size_t> refl_flags =
       reflection_table.get<std::size_t>("flags");
 
@@ -413,8 +370,6 @@ namespace dials { namespace algorithms {
 
     dials::af::shared<double> fit_value(n_reflections, 0.0);
     dials::af::shared<double> fit_variance(n_reflections, -1.0);
-    dials::af::shared<double> ml_value(n_reflections, 0.0);
-    dials::af::shared<double> ml_variance(n_reflections, -1.0);
     dials::af::shared<double> fit_chi2(n_reflections, -1.0);
     dials::af::shared<double> fit_fraction(n_reflections, 0.0);
     std::vector<char> cluster_fitted(clusters.size(), 0);
@@ -606,12 +561,6 @@ namespace dials { namespace algorithms {
         fit_fraction[members[a]] = fraction[a];
       }
 
-      Eigen::VectorXd mu(K), tau2(K);
-      for (int a = 0; a < K; ++a) {
-        mu[a] = intensity_scale * prior_value[members[a]];
-        tau2[a] = intensity_scale * intensity_scale * prior_variance[members[a]];
-      }
-
       // Start from uniform expected counts, which is an unweighted fit where
       // the gain is constant, then reweight by what the model expects
       std::vector<double> variance(n_voxels);
@@ -619,8 +568,7 @@ namespace dials { namespace algorithms {
       for (std::size_t i = 0; i < n_voxels; ++i) {
         variance[i] = voxel_gain[i] * voxel_gain[i] * mean_counts + voxel_fixed_var[i];
       }
-      OverlapClusterFit fit =
-        solve_overlap_cluster(design, voxel_data, variance, mu, tau2);
+      OverlapClusterFit fit = solve_overlap_cluster(design, voxel_data, variance);
       for (int iteration = 0; iteration < n_reweight && fit.success; ++iteration) {
         for (std::size_t i = 0; i < n_voxels; ++i) {
           double expected = voxel_background[i]
@@ -628,7 +576,7 @@ namespace dials { namespace algorithms {
           expected = std::max(expected, min_expected_counts);
           variance[i] = voxel_gain[i] * voxel_gain[i] * expected + voxel_fixed_var[i];
         }
-        fit = solve_overlap_cluster(design, voxel_data, variance, mu, tau2);
+        fit = solve_overlap_cluster(design, voxel_data, variance);
       }
       if (!fit.success) {
         return false;
@@ -665,9 +613,6 @@ namespace dials { namespace algorithms {
         inflation = std::max(reduced_chi2, 1.0);
       }
       fit.covariance *= inflation;
-      if (fit.ml_success) {
-        fit.ml_covariance *= inflation;
-      }
 
       // The background level of each owner, shifted by the same amount in
       // every voxel it owns
@@ -682,26 +627,15 @@ namespace dials { namespace algorithms {
         }
       }
       // Covariance before inflation maps P^T W (shift) to the change in a
-      Eigen::MatrixXd post_map = fit.covariance / inflation;
-      Eigen::MatrixXd ml_map;
-      if (fit.ml_success) {
-        ml_map = fit.ml_covariance / inflation;
-      }
+      Eigen::MatrixXd shift_map = fit.covariance / inflation;
       for (int o = 0; o < K; ++o) {
         if (!(owner_n_background[o] > 0.0) || !(owner_n_voxels[o] > 0.0)) {
           continue;
         }
         double var_level =
           owner_background[o] / owner_n_voxels[o] / owner_n_background[o];
-        Eigen::VectorXd d_post = post_map * shift[o];
-        fit.covariance += var_level * d_post * d_post.transpose();
-        if (fit.ml_success) {
-          Eigen::VectorXd d_ml = ml_map * shift[o];
-          fit.ml_covariance += var_level * d_ml * d_ml.transpose();
-        }
-      }
-      if (fit.ml_success) {
-        fit.ml_variance = fit.ml_covariance.diagonal();
+        Eigen::VectorXd d = shift_map * shift[o];
+        fit.covariance += var_level * d * d.transpose();
       }
 
       for (int a = 0; a < K; ++a) {
@@ -715,11 +649,6 @@ namespace dials { namespace algorithms {
         fit_chi2[m] = reduced_chi2;
         fit_value[m] = fit.value[a] / intensity_scale;
         fit_variance[m] = fit.covariance(a, a) / (intensity_scale * intensity_scale);
-        if (fit.ml_success && std::isfinite(fit.ml_value[a])
-            && fit.ml_variance[a] > 0.0) {
-          ml_value[m] = fit.ml_value[a] / intensity_scale;
-          ml_variance[m] = fit.ml_variance[a] / (intensity_scale * intensity_scale);
-        }
       }
       return true;
     };
@@ -744,13 +673,11 @@ namespace dials { namespace algorithms {
 
     reflection_table["overlap.fit.value"] = fit_value;
     reflection_table["overlap.fit.variance"] = fit_variance;
-    reflection_table["overlap.ml.value"] = ml_value;
-    reflection_table["overlap.ml.variance"] = ml_variance;
     reflection_table["overlap.fit.chi2"] = fit_chi2;
     reflection_table["overlap.fit.fraction"] = fit_fraction;
 
-    // An overlapped reflection (any member, with replace_all) takes the
-    // posterior as its profile-fitted intensity
+    // An overlapped reflection (any member, with replace_all) takes the fit
+    // as its profile-fitted intensity
     dials::af::shared<double> intensities_prf(n_reflections, 0.0);
     dials::af::shared<double> variances_prf(n_reflections, 0.0);
     if (reflection_table.contains("intensity.prf.value")

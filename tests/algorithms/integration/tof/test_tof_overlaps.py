@@ -13,7 +13,6 @@ from dials.algorithms.shoebox import MaskCode
 from dials.array_family import flex
 from dials.command_line.tof_integrate import (
     find_overlap_clusters,
-    load_reference_intensities,
     phil_scope,
     run_integrate,
 )
@@ -172,15 +171,13 @@ def two_peaks(separation):
     return profiles / profiles.sum(axis=0)
 
 
-def fit(profiles, data, variance, prior_value, prior_variance):
+def fit(profiles, data, variance):
     return [
         np.array(a)
         for a in fit_overlap_cluster(
             flumpy.from_numpy(np.ascontiguousarray(profiles)),
             flex.double(data),
             flex.double(variance),
-            flex.double(prior_value),
-            flex.double(prior_variance),
         )
     ]
 
@@ -191,16 +188,12 @@ def test_fit_overlap_cluster_recovers_known_intensities():
     data = profiles @ truth
     variance = np.ones(len(data))
 
-    value, value_variance, ml_value, ml_variance = fit(
-        profiles, data, variance, [0, 0], [-1, -1]
-    )
+    value, value_variance = fit(profiles, data, variance)
     assert value == pytest.approx(truth)
-    assert ml_value == pytest.approx(truth)
     assert np.all(value_variance > 0)
-    assert value_variance == pytest.approx(ml_variance)
 
 
-def test_fit_overlap_cluster_posterior_variance_is_calibrated():
+def test_fit_overlap_cluster_variance_is_calibrated():
     # Over many noisy realisations the scatter of the estimate must match the
     # variance it reports
     rng = np.random.default_rng(0)
@@ -210,50 +203,21 @@ def test_fit_overlap_cluster_posterior_variance_is_calibrated():
     estimates = []
     for _ in range(400):
         data = profiles @ truth + rng.normal(0.0, 2.0, profiles.shape[0])
-        value, value_variance, _, _ = fit(profiles, data, variance, [0, 0], [-1, -1])
+        value, value_variance = fit(profiles, data, variance)
         estimates.append(value)
     estimates = np.array(estimates)
     assert estimates.mean(axis=0) == pytest.approx(truth, rel=0.02)
     assert estimates.var(axis=0) == pytest.approx(value_variance, rel=0.25)
 
 
-def test_fit_overlap_cluster_prior():
-    rng = np.random.default_rng(1)
-    profiles = two_peaks(separation=2.0)  # close: the data separate them poorly
-    truth = np.array([1000.0, 300.0])
-    data = profiles @ truth + rng.normal(0.0, 5.0, profiles.shape[0])
-    variance = np.full(len(data), 25.0)
-
-    _, _, ml_value, ml_variance = fit(profiles, data, variance, [0, 0], [-1, -1])
-
-    # A prior on one reflection tightens both, since they are anticorrelated
-    value, value_variance, ml_again, _ = fit(
-        profiles, data, variance, [0, 300.0], [-1, 10.0**2]
-    )
-    assert np.all(value_variance < ml_variance)
-    assert abs(value[1] - 300.0) <= abs(ml_value[1] - 300.0)
-    assert ml_again == pytest.approx(ml_value)  # reported free of the prior
-
-    # A wrong prior pulls the answer, and shows as a gap from the data alone
-    wrong, _, _, _ = fit(profiles, data, variance, [0, 900.0], [-1, 10.0**2])
-    assert wrong[1] > ml_value[1] + 3 * np.sqrt(ml_variance[1])
-
-    # A wide prior changes nothing
-    wide, _, _, _ = fit(profiles, data, variance, [0, 900.0], [-1, 1e12])
-    assert wide == pytest.approx(ml_value, rel=1e-3)
-
-
-def test_fit_overlap_cluster_degenerate_needs_prior():
-    # Two reflections with the same profile: only their sum is measured
+def test_fit_overlap_cluster_degenerate_fails():
+    # Two reflections with the same profile: only their sum is measured, so
+    # the fit refuses
     profile = two_peaks(separation=0.0)
     data = profile @ np.array([700.0, 300.0])
     variance = np.ones(len(data))
-    value, value_variance, _, ml_variance = fit(
-        profile, data, variance, [700.0, 300.0], [50.0**2, 50.0**2]
-    )
-    assert np.all(ml_variance < 0)  # the data alone do not determine them
-    assert value == pytest.approx([700.0, 300.0])
-    assert np.all(value_variance > 0)
+    _, value_variance = fit(profile, data, variance)
+    assert np.all(value_variance < 0)
 
 
 @pytest.fixture(scope="module")
@@ -314,7 +278,7 @@ def test_mask_mode_keeps_overlapped_reflections(sxd_nacl):
         )
 
 
-def test_deconvolve_mode(sxd_nacl, tmp_path):
+def test_deconvolve_mode(sxd_nacl):
     with pytest.raises(ValueError):
         integrate(sxd_nacl, "overlaps.mode=deconvolve", "method=summation")
 
@@ -327,7 +291,7 @@ def test_deconvolve_mode(sxd_nacl, tmp_path):
         "ellipse_mask.scale=2",
         "mp.nproc=1",
     ]
-    experiments, reflections = integrate(sxd_nacl, *settings)
+    _, reflections = integrate(sxd_nacl, *settings)
 
     flags = reflections.flags
     overlapped_fg = reflections.get_flags(flags.overlapped_fg)
@@ -336,7 +300,7 @@ def test_deconvolve_mode(sxd_nacl, tmp_path):
     assert (overlapped_fg & fitted).count(True) > 0
     assert (fitted & (reflections["overlap.cluster_id"] < 0)).count(True) == 0
 
-    # A deconvolved reflection carries the posterior as its profile intensity
+    # A deconvolved reflection carries the joint fit as its profile intensity
     deconvolved = overlapped_fg & fitted
     assert (deconvolved & ~reflections.get_flags(flags.integrated_prf)).count(True) == 0
     sel = reflections.select(deconvolved)
@@ -346,55 +310,6 @@ def test_deconvolve_mode(sxd_nacl, tmp_path):
     assert list(sel["intensity.prf.variance"]) == pytest.approx(
         list(sel["overlap.fit.variance"])
     )
-    # No reference was given, so there is no prior and the posterior is the
-    # data alone
-    assert (reflections["overlap.prior.variance"] > 0).count(True) == 0
-    assert list(sel["overlap.ml.value"]) == pytest.approx(
-        list(sel["overlap.fit.value"])
-    )
-
-    # A merged reference is matched to every reflection it holds
-    from cctbx import crystal, miller
-
-    crystal_model = experiments[0].crystal
-    symmetry = crystal.symmetry(
-        unit_cell=crystal_model.get_unit_cell(),
-        space_group=crystal_model.get_space_group(),
-    )
-    clean = reflections.select(
-        reflections.get_flags(flags.integrated_prf)
-        & ~overlapped_fg
-        & (reflections["intensity.prf.variance"] > 0)
-    )
-    merged = (
-        miller.array(
-            miller.set(symmetry, clean["miller_index"], anomalous_flag=False),
-            clean["intensity.prf.value"],
-            flex.sqrt(clean["intensity.prf.variance"]),
-        )
-        .map_to_asu()
-        .merge_equivalents()
-        .array()
-        .set_observation_type_xray_intensity()
-    )
-    mtz_path = join(tmp_path, "reference.mtz")
-    merged.as_mtz_dataset(column_root_label="IMEAN").mtz_object().write(mtz_path)
-
-    table = flex.reflection_table()
-    table["miller_index"] = reflections["miller_index"]
-    load_reference_intensities(mtz_path, experiments, table)
-    matched = table["intensity.reference.variance"] > 0
-    assert matched.count(True) >= len(clean)
-    lookup = dict(zip(merged.indices(), merged.data()))
-    asu = miller.set(symmetry, table["miller_index"], anomalous_flag=False).map_to_asu()
-    for i in range(0, len(table), 17):
-        if matched[i]:
-            assert table["intensity.reference.value"][i] == pytest.approx(
-                lookup[asu.indices()[i]]
-            )
-
-    with pytest.raises(NotImplementedError):
-        load_reference_intensities("scaled.refl", experiments, table)
 
 
 @pytest.mark.parametrize("mode", ["mask", "deconvolve"])

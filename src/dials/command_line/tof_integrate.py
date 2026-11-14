@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
-import os
 import re
 import sys
 import warnings
@@ -488,33 +487,10 @@ overlaps
                 "flagged overlapped_fg and not integrated. "
                 "deconvolve: as mask, then fit each cluster of overlapped"
                 "reflections jointly in 3D, with shapes taken from the profile"
-                "library and, if overlaps.reference is given, a prior on each"
-                "intensity. Requires method=profile_1d_profilelib. Peak"
+                "library. Requires method=profile_1d_profilelib. Peak"
                 "positions are held at their predictions, corrected by the"
                 "offsets the library measured nearby, and a peak's position on"
                 "the detector is taken not to drift with ToF."
-    reference = None
-        .type = path
-        .help = "Merged intensities from data integrated without overlaps"
-                "(a merged .mtz), used as a prior on the intensity of each"
-                "overlapped reflection. It must be indexed consistently with"
-                "the input experiments. Without it the overlaps are separated"
-                "by shape alone."
-    prior_sigma_scale = 1.0
-        .type = float(value_min=0.01)
-        .help = "Factor applied to the width of the intensity prior. Raise it"
-                "to weaken the prior if the deconvolved intensities are being"
-                "pulled towards the reference."
-    min_reference_cc = 0.5
-        .type = float(value_min=-1, value_max=1)
-        .help = "Correlation the reference must reach with an experiment's"
-                "own unoverlapped intensities, once scaled to them, for it to"
-                "be used as a prior there. A reference indexed differently"
-                "from the experiments falls below this."
-    n_wavelength_bins = 20
-        .type = int(value_min=1)
-        .help = "Number of wavelength bins in the scale between the reference"
-                "and an experiment's own unoverlapped intensities."
     estimator = *separate joint
         .type = choice
         .help = "separate: reflections fitted on their own keep the 1D profile"
@@ -522,7 +498,7 @@ overlaps
                 "divided by the median ratio of the two fits on strong"
                 "unoverlapped reflections. "
                 "joint: every reflection is fitted with the 3D model (one that"
-                "overlaps nothing as a cluster of its own, without a prior), so"
+                "overlaps nothing as a cluster of its own), so"
                 "that all profile-fitted intensities come from one estimator."
                 "The 1D profile fit is kept as intensity.prf_1d. Works with"
                 "every overlaps.mode; requires method=profile_1d_profilelib."
@@ -961,94 +937,6 @@ def mask_neighbour_foreground(
     return coupled
 
 
-def load_reference_intensities(
-    path: str,
-    experiments: ExperimentList,
-    reflections: flex.reflection_table,
-) -> flex.reflection_table:
-    """
-    Reads merged intensities and gives each reflection that of its unique
-    reflection, as intensity.reference.value and intensity.reference.variance.
-    A variance of -1 marks a reflection the reference does not hold.
-
-    The reference is on its own scale; compute_overlap_priors brings it to the
-    scale of each experiment.
-    """
-    extension = os.path.splitext(path)[1].lower()
-    if extension == ".refl":
-        # TODO: accept a scaled DIALS reflection table. Merge the symmetry
-        # equivalents of its scaled intensities (intensity.scale.value over
-        # inverse_scale_factor), leaving out any flagged overlapped_fg, into
-        # the mean and variance per unique reflection that a merged MTZ
-        # supplies, and continue as below.
-        raise NotImplementedError(
-            "overlaps.reference does not yet accept a reflection table;"
-            " give a merged .mtz"
-        )
-    if extension != ".mtz":
-        raise ValueError(f"overlaps.reference must be a merged .mtz file, not '{path}'")
-
-    from cctbx import miller
-    from iotbx import mtz
-
-    arrays = mtz.object(path).as_miller_arrays()
-    reference = None
-    for array in arrays:
-        if array.is_xray_intensity_array() and array.sigmas() is not None:
-            reference = array
-            break
-    if reference is None:
-        for array in arrays:
-            if array.is_xray_amplitude_array() and array.sigmas() is not None:
-                label = array.info().label_string()
-                reference = array.f_as_f_sq().set_info(array.info())
-                logger.info(f"Squaring the amplitudes {label} of {path}")
-                break
-    if reference is None:
-        raise ValueError(f"No intensities or amplitudes with sigmas found in {path}")
-    label = reference.info().label_string()
-
-    if reference.anomalous_flag():
-        reference = reference.average_bijvoet_mates()
-    reference = reference.map_to_asu()
-    if not reference.is_unique_set_under_symmetry():
-        reference = reference.merge_equivalents().array()
-
-    point_group = experiments[0].crystal.get_space_group().build_derived_point_group()
-    if reference.space_group().build_derived_point_group() != point_group:
-        logger.warning(
-            f"The space group of {path}"
-            f" ({reference.space_group_info()}) and of the experiments"
-            f" ({experiments[0].crystal.get_space_group().info()})"
-            " differ in point group"
-        )
-
-    indices = miller.set(
-        crystal_symmetry=reference.crystal_symmetry(),
-        indices=reflections["miller_index"],
-        anomalous_flag=False,
-    ).map_to_asu()
-    pairs = miller.match_multi_indices(
-        miller_indices_unique=reference.indices(), miller_indices=indices.indices()
-    ).pairs()
-    i_reference = pairs.column(0)
-    i_reflection = pairs.column(1)
-
-    value = flex.double(len(reflections), 0.0)
-    variance = flex.double(len(reflections), -1.0)
-    value.set_selected(i_reflection, reference.data().select(i_reference).as_double())
-    variance.set_selected(
-        i_reflection, flex.pow2(reference.sigmas().select(i_reference).as_double())
-    )
-    reflections["intensity.reference.value"] = value
-    reflections["intensity.reference.variance"] = variance
-    logger.info(
-        f"Reference intensities {label} from {path}:"
-        f" {(variance > 0).count(True)} of {len(reflections)} reflections matched"
-    )
-    return reflections
-
-
 def find_overlap_clusters(
     n_reflections: int, coupled_pairs: Tuple[flex.size_t, flex.size_t]
 ) -> flex.int:
@@ -1076,130 +964,6 @@ def find_overlap_clusters(
     _, compact = np.unique(labels[member], return_inverse=True)
     cluster_id[member] = compact
     return flumpy.from_numpy(cluster_id)
-
-
-def compute_overlap_priors(
-    reflections: flex.reflection_table, params: libtbx.phil.scope_extract
-) -> bool:
-    """
-    Turns the reference intensities into a prior on the intensity of each
-    reflection of one experiment, as overlap.prior.value and
-    overlap.prior.variance. A variance of -1 means no prior.
-
-    The reference is merged and scaled; an integrated intensity is neither, and
-    depends on wavelength through the incident spectrum and whatever part of
-    the Lorentz factor was applied. The two are related here by a scale
-    k(wavelength), the ratio of summed intensities in bins of wavelength, taken
-    from the reflections of this experiment that were integrated without
-    overlap. Their relative scatter f about the scaled reference, per bin, says
-    how well one observation is predicted by it, so the prior for a reflection
-    with reference intensity I and variance v is
-
-        mean = k I,   variance = k^2 v + (f k I)^2
-
-    widened by overlaps.prior_sigma_scale. f includes the measurement error of
-    the reflections it is taken from, so the prior errs on the wide side.
-
-    Returns False, leaving every reflection without a prior, if there is no
-    reference or it does not correlate with this experiment's intensities.
-    """
-    n = len(reflections)
-    reflections["overlap.prior.value"] = flex.double(n, 0.0)
-    reflections["overlap.prior.variance"] = flex.double(n, -1.0)
-    if "intensity.reference.value" not in reflections:
-        return False
-
-    i_ref = flumpy.to_numpy(reflections["intensity.reference.value"])
-    var_ref = flumpy.to_numpy(reflections["intensity.reference.variance"])
-    i_raw = flumpy.to_numpy(reflections["intensity.prf.value"])
-    var_raw = flumpy.to_numpy(reflections["intensity.prf.variance"])
-    wavelength = flumpy.to_numpy(reflections["wavelength_cal"])
-    flags = reflections.flags
-    integrated = flumpy.to_numpy(reflections.get_flags(flags.integrated_prf))
-    overlapped = flumpy.to_numpy(reflections.get_flags(flags.overlapped_fg))
-    has_ref = var_ref > 0
-    clean = integrated & ~overlapped & has_ref & np.isfinite(i_raw) & (var_raw > 0)
-
-    n_clean = int(clean.sum())
-    if n_clean < 10:
-        logger.info(
-            f"    Only {n_clean} unoverlapped reflections match the reference:"
-            " no intensity prior"
-        )
-        return False
-
-    # Bins of equal population in wavelength
-    n_bins = max(1, min(params.overlaps.n_wavelength_bins, n_clean // 20))
-    edges = np.quantile(wavelength[clean], np.linspace(0.0, 1.0, n_bins + 1))
-    which = np.clip(
-        np.searchsorted(edges, wavelength[clean], side="right") - 1, 0, n_bins - 1
-    )
-    centre = np.full(n_bins, np.nan)
-    scale = np.full(n_bins, np.nan)
-    for b in range(n_bins):
-        sel = which == b
-        if not sel.any():
-            continue
-        numerator = i_raw[clean][sel].sum()
-        denominator = i_ref[clean][sel].sum()
-        if numerator > 0 and denominator > 0:
-            centre[b] = np.median(wavelength[clean][sel])
-            scale[b] = numerator / denominator
-    good = np.isfinite(scale)
-    if not good.any():
-        logger.info("    No scale to the reference could be found: no intensity prior")
-        return False
-    k = np.interp(wavelength, centre[good], scale[good])
-
-    predicted = k[clean] * i_ref[clean]
-    cc = float(np.corrcoef(i_raw[clean], predicted)[0, 1])
-    if not cc >= params.overlaps.min_reference_cc:
-        logger.warning(
-            f"    The reference correlates {cc:.3f} with this experiment's"
-            f" unoverlapped intensities, below overlaps.min_reference_cc="
-            f"{params.overlaps.min_reference_cc}: no intensity prior."
-            " Is it indexed consistently with the experiments?"
-        )
-        return False
-
-    # Relative scatter of one strong observation about the scaled reference
-    strong = (
-        (i_raw[clean] > 5.0 * np.sqrt(var_raw[clean]))
-        & (i_ref[clean] > 5.0 * np.sqrt(var_ref[clean]))
-        & (predicted > 0)
-    )
-
-    def robust_scatter(ratio):
-        return 1.4826 * np.median(np.abs(ratio - np.median(ratio)))
-
-    ratio = i_raw[clean][strong] / predicted[strong]
-    if len(ratio) >= 5:
-        overall = robust_scatter(ratio)
-    else:
-        ratio_all = i_raw[clean][predicted > 0] / predicted[predicted > 0]
-        overall = robust_scatter(ratio_all) if len(ratio_all) else 1.0
-    scatter = np.full(n_bins, overall)
-    for b in range(n_bins):
-        sel = which[strong] == b
-        if sel.sum() >= 5:
-            scatter[b] = robust_scatter(ratio[sel])
-    f = np.interp(wavelength, centre[good], scatter[good])
-
-    mean = k * i_ref
-    variance = params.overlaps.prior_sigma_scale**2 * (
-        k**2 * np.where(has_ref, var_ref, 0.0) + (f * mean) ** 2
-    )
-    usable = has_ref & np.isfinite(mean) & np.isfinite(variance) & (variance > 0)
-    reflections["overlap.prior.value"] = flumpy.from_numpy(np.where(usable, mean, 0.0))
-    reflections["overlap.prior.variance"] = flumpy.from_numpy(
-        np.where(usable, variance, -1.0)
-    )
-    logger.info(
-        f"    Intensity prior from {n_clean} unoverlapped reflections in"
-        f" {int(good.sum())} wavelength bins: CC to the scaled reference"
-        f" {cc:.3f}, scatter of one observation about it {np.median(scatter[good]):.0%}"
-    )
-    return True
 
 
 def calibrate_joint_fit(
@@ -1252,8 +1016,6 @@ def calibrate_joint_fit(
     sample = expt_reflections.select(indices)
     n = len(sample)
     sample["overlap.cluster_id"] = flex.int(range(n))
-    sample["overlap.prior.value"] = flex.double(n, 0.0)
-    sample["overlap.prior.variance"] = flex.double(n, -1.0)
     tof_deconvolve_overlaps(
         sample,
         expt,
@@ -1265,7 +1027,7 @@ def calibrate_joint_fit(
         params.mp.nproc,
         profile_fitter,
     )
-    fitted = flumpy.to_numpy(sample["overlap.ml.variance"]) > 0
+    fitted = flumpy.to_numpy(sample["overlap.fit.variance"]) > 0
     if fitted.sum() < 20:
         logger.info(
             "    Too few strong unoverlapped reflections could be fitted in 3D"
@@ -1273,7 +1035,7 @@ def calibrate_joint_fit(
             " they are"
         )
         return 1.0
-    joint = flumpy.to_numpy(sample["overlap.ml.value"])[fitted]
+    joint = flumpy.to_numpy(sample["overlap.fit.value"])[fitted]
     own = flumpy.to_numpy(sample["intensity.prf.value"])[fitted]
     ratio = joint / own
     scale = float(np.median(ratio))
@@ -1300,22 +1062,18 @@ def deconvolve_overlaps(
 ) -> flex.reflection_table:
     """
     Fits each cluster of overlapped reflections jointly, with shapes from the
-    profile library and the intensity prior from compute_overlap_priors.
+    profile library.
 
-    A reflection flagged overlapped_fg takes the posterior as
-    intensity.prf.value and intensity.prf.variance and gains integrated_prf.
-    Every member of a fitted cluster gets overlap.fit.value / .variance (the
-    posterior) and overlap.ml.value / .variance (the data alone), which with
-    overlap.prior.value / .variance show how far the prior moved it. Variances
-    of -1 mark values that are absent.
+    A reflection flagged overlapped_fg takes the fit as intensity.prf.value
+    and intensity.prf.variance and gains integrated_prf. Every member of a
+    fitted cluster gets overlap.fit.value / .variance; a variance of -1 marks
+    a reflection that was not fitted.
     """
     n = len(expt_reflections)
     cluster_id = find_overlap_clusters(n, coupled_pairs)
     expt_reflections["overlap.cluster_id"] = cluster_id
-    compute_overlap_priors(expt_reflections, params)
-    for name in ("overlap.fit", "overlap.ml"):
-        expt_reflections[name + ".value"] = flex.double(n, 0.0)
-        expt_reflections[name + ".variance"] = flex.double(n, -1.0)
+    expt_reflections["overlap.fit.value"] = flex.double(n, 0.0)
+    expt_reflections["overlap.fit.variance"] = flex.double(n, -1.0)
     expt_reflections["overlap.fit.chi2"] = flex.double(n, -1.0)
     expt_reflections["overlap.fit.fraction"] = flex.double(n, 0.0)
 
@@ -1373,10 +1131,8 @@ def fit_profiles_jointly(
     the same estimator and no scale between two fits is needed.
 
     With coupled_pairs (overlaps.mode=deconvolve) the overlapped reflections
-    are fitted in their clusters, with the intensity prior if a reference was
-    given. Every other reflection that can be integrated is a cluster of its
-    own and has no prior: a reflection measured without overlap is not pulled
-    towards its equivalents.
+    are fitted in their clusters. Every other reflection that can be
+    integrated is a cluster of its own.
 
     The 1D profile fit is kept as intensity.prf_1d.value / .variance (variance
     -1 where it failed). A reflection the 3D model cannot fit loses its
@@ -1402,15 +1158,10 @@ def fit_profiles_jointly(
 
     if coupled_pairs is not None:
         cluster_id = find_overlap_clusters(n, coupled_pairs)
-        expt_reflections["overlap.cluster_id"] = cluster_id
-        compute_overlap_priors(expt_reflections, params)
     else:
         cluster_id = flex.int(n, -1)
-        expt_reflections["overlap.prior.value"] = flex.double(n, 0.0)
-        expt_reflections["overlap.prior.variance"] = flex.double(n, -1.0)
 
-    # Everything else that can be integrated is a cluster of one, without a
-    # prior
+    # Everything else that can be integrated is a cluster of one
     candidates = (
         (cluster_id < 0)
         & ~expt_reflections.get_flags(flags.overlapped_fg)
@@ -1420,13 +1171,9 @@ def fit_profiles_jointly(
     singles = candidates.iselection()
     first = flex.max(cluster_id) + 1 if (cluster_id >= 0).count(True) else 0
     cluster_id.set_selected(singles, flex.int(range(first, first + len(singles))))
-    prior_variance = expt_reflections["overlap.prior.variance"]
-    prior_variance.set_selected(singles, -1.0)
-    expt_reflections["overlap.prior.variance"] = prior_variance
     expt_reflections["overlap.cluster_id"] = cluster_id
-    for name in ("overlap.fit", "overlap.ml"):
-        expt_reflections[name + ".value"] = flex.double(n, 0.0)
-        expt_reflections[name + ".variance"] = flex.double(n, -1.0)
+    expt_reflections["overlap.fit.value"] = flex.double(n, 0.0)
+    expt_reflections["overlap.fit.variance"] = flex.double(n, -1.0)
     expt_reflections["overlap.fit.chi2"] = flex.double(n, -1.0)
     expt_reflections["overlap.fit.fraction"] = flex.double(n, 0.0)
 
@@ -1475,18 +1222,12 @@ def log_deconvolution_summary(
     reflections: flex.reflection_table, n_fitted: int
 ) -> None:
     """
-    Reports what the joint fits did, and the two checks on them that need
-    nothing but this experiment: how far the prior moved the intensities, and
-    how the joint fit compares with the intensities of the cluster members
-    that could also be integrated on their own.
+    Reports what the joint fits did, and how they compare with the 1D profile
+    fit of the cluster members that could also be integrated on their own.
     """
     cluster_id = flumpy.to_numpy(reflections["overlap.cluster_id"])
     fit = flumpy.to_numpy(reflections["overlap.fit.value"])
     fit_var = flumpy.to_numpy(reflections["overlap.fit.variance"])
-    ml = flumpy.to_numpy(reflections["overlap.ml.value"])
-    ml_var = flumpy.to_numpy(reflections["overlap.ml.variance"])
-    prior = flumpy.to_numpy(reflections["overlap.prior.value"])
-    prior_var = flumpy.to_numpy(reflections["overlap.prior.variance"])
     flags = reflections.flags
     overlapped = flumpy.to_numpy(reflections.get_flags(flags.overlapped_fg))
 
@@ -1499,25 +1240,6 @@ def log_deconvolution_summary(
         " reflections given an intensity"
     )
 
-    sel = recovered & (prior_var > 0)
-    if sel.any():
-        pull = (fit[sel] - prior[sel]) / np.sqrt(prior_var[sel])
-        data_weight = 1.0 - fit_var[sel] / prior_var[sel]
-        message = (
-            f"    With a prior ({int(sel.sum())}): median weight of the data in"
-            f" the posterior {np.median(data_weight):.2f}, posterior minus prior"
-            f" in prior sigmas: median {np.median(pull):+.2f},"
-            f" rms {np.sqrt(np.mean(pull**2)):.2f}"
-        )
-        both = sel & (ml_var > 0)
-        if both.any():
-            shift = (fit[both] - ml[both]) / np.sqrt(ml_var[both])
-            message += (
-                ". Moved by the prior, in sigmas of the data alone: median"
-                f" {np.median(np.abs(shift)):.2f}"
-            )
-        logger.info(message)
-
     if "intensity.prf_1d.value" in reflections:
         i_prf = flumpy.to_numpy(reflections["intensity.prf_1d.value"])
         var_prf = flumpy.to_numpy(reflections["intensity.prf_1d.variance"])
@@ -1526,14 +1248,14 @@ def log_deconvolution_summary(
         integrated = flumpy.to_numpy(reflections.get_flags(flags.integrated_prf))
         i_prf = flumpy.to_numpy(reflections["intensity.prf.value"])
         var_prf = flumpy.to_numpy(reflections["intensity.prf.variance"])
-    sel = fitted & ~overlapped & integrated & (var_prf > 0) & (ml_var > 0)
+    sel = fitted & ~overlapped & integrated & (var_prf > 0)
     if sel.sum() >= 5:
-        z = (ml[sel] - i_prf[sel]) / np.sqrt(ml_var[sel] + var_prf[sel])
+        z = (fit[sel] - i_prf[sel]) / np.sqrt(fit_var[sel] + var_prf[sel])
         logger.info(
             f"    Check on {int(sel.sum())} reflections also fitted in 1D:"
-            " 3D fit without prior against the 1D profile fit,"
-            f" CC {np.corrcoef(ml[sel], i_prf[sel])[0, 1]:.3f}, median ratio"
-            f" {np.median(ml[sel] / i_prf[sel]):.2f}, rms difference"
+            " 3D fit against the 1D profile fit,"
+            f" CC {np.corrcoef(fit[sel], i_prf[sel])[0, 1]:.3f}, median ratio"
+            f" {np.median(fit[sel] / i_prf[sel]):.2f}, rms difference"
             f" {np.sqrt(np.mean(z**2)):.2f} sigma"
         )
 
@@ -1998,21 +1720,6 @@ def run_integrate(
     predicted_reflections = remove_out_of_range_reflections(
         predicted_reflections, params
     )
-
-    if params.overlaps.reference is not None:
-        if params.overlaps.mode == "deconvolve":
-            predicted_reflections = load_reference_intensities(
-                params.overlaps.reference, experiments, predicted_reflections
-            )
-        else:
-            logger.warning(
-                "overlaps.reference is only used with overlaps.mode=deconvolve"
-            )
-    elif params.overlaps.mode == "deconvolve":
-        logger.info(
-            "No overlaps.reference given: overlapped reflections will be"
-            " separated by shape alone"
-        )
 
     corrections_data = get_corrections_data(experiments=experiments, params=params)
 
