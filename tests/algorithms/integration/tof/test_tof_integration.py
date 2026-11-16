@@ -129,3 +129,19 @@ def test_tof_integration(dials_data, tmp_path):
         capture_output=True,
     )
     assert not result.returncode and not result.stderr
+
+    # 3D profile fitting with profile library (iBIX x bivariate Gaussian + library)
+    result = subprocess.run(
+        [
+            shutil.which("dials.tof_integrate"),
+            expt_path,
+            refl_path,
+            "method=profile_3d_profilelib",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+    )
+    assert not result.returncode and not result.stderr
+    integrated = flex.reflection_table.from_file(join(tmp_path, "integrated.refl"))
+    fitted = integrated.get_flags(integrated.flags.integrated_prf)
+    assert fitted.count(True) > 0.5 * len(integrated)

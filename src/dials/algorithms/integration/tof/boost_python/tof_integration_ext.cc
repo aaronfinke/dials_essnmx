@@ -8,6 +8,7 @@
 #include <dials/algorithms/integration/tof/tof_profile_3d_gutmann.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_ic.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_ibix.h>
+#include <dials/algorithms/integration/tof/tof_profile_3d_profilelib.h>
 #include <dials/algorithms/scaling/tof/tof_scaling.h>
 
 namespace dials { namespace algorithms { namespace boost_python {
@@ -20,14 +21,21 @@ namespace dials { namespace algorithms { namespace boost_python {
     object profile_3d_gutmann_params_obj,
     object profile_3d_ic_params_obj,
     object profile_3d_ibix_params_obj,
-    object profile_1d_profilelib_params_obj) {
+    object profile_1d_profilelib_params_obj,
+    object profile_3d_profilelib_params_obj) {
     // Only one profile fitting method allowed
     int n_given =
       !profile_1d_ibix_params_obj.is_none() + !profile_1d_ic_params_obj.is_none()
       + !profile_3d_gutmann_params_obj.is_none() + !profile_3d_ic_params_obj.is_none()
       + !profile_3d_ibix_params_obj.is_none()
-      + !profile_1d_profilelib_params_obj.is_none();
+      + !profile_1d_profilelib_params_obj.is_none()
+      + !profile_3d_profilelib_params_obj.is_none();
     DIALS_ASSERT(n_given <= 1);
+
+    if (!profile_3d_profilelib_params_obj.is_none()) {
+      return std::make_shared<Profile3DProfilelibFitter>(
+        extract<TOFProfile3DProfilelibParams>(profile_3d_profilelib_params_obj)());
+    }
 
     if (!profile_1d_profilelib_params_obj.is_none()) {
       return std::make_shared<Profile1DProfilelibFitter>(
@@ -85,6 +93,33 @@ namespace dials { namespace algorithms { namespace boost_python {
       d("trust_peak_height_fraction"),
       d("library_min_i_sigma"),
       d("library_min_corr"));
+  }
+
+  std::shared_ptr<TOFProfile3DProfilelibParams> make_TOFProfile3DProfilelibParams(
+    dict params) {
+    auto d = [&](const char* key) { return extract<double>(params[key])(); };
+    auto i = [&](const char* key) { return extract<int>(params[key])(); };
+    auto b = [&](const char* key) { return extract<bool>(params[key])(); };
+    return std::make_shared<TOFProfile3DProfilelibParams>(
+      d("alpha"),
+      d("alpha_min"),
+      d("alpha_max"),
+      d("beta"),
+      d("beta_min"),
+      d("beta_max"),
+      d("SigX_min"),
+      d("SigX_max"),
+      d("SigY_min"),
+      d("SigY_max"),
+      d("SigP_min"),
+      d("SigP_max"),
+      d("max_drift_factor"),
+      i("n_restarts"),
+      b("show_profile_failures"),
+      d("library_min_i_sigma"),
+      d("library_min_corr"),
+      d("position_tolerance"),
+      d("free_position_min_i_sigma"));
   }
 
   std::shared_ptr<TOFProfile1DICParams> make_TOFProfile1DICParams(dict params) {
@@ -173,7 +208,8 @@ namespace dials { namespace algorithms { namespace boost_python {
                                           object profile_3d_ic_params_obj,
                                           object profile_3d_ibix_params_obj,
                                           object profile_1d_profilelib_params_obj,
-                                          double lorentz_wavelength_power) {
+                                          double lorentz_wavelength_power,
+                                          object profile_3d_profilelib_params_obj) {
     boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
     boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params;
 
@@ -192,7 +228,8 @@ namespace dials { namespace algorithms { namespace boost_python {
                           profile_3d_gutmann_params_obj,
                           profile_3d_ic_params_obj,
                           profile_3d_ibix_params_obj,
-                          profile_1d_profilelib_params_obj);
+                          profile_1d_profilelib_params_obj,
+                          profile_3d_profilelib_params_obj);
 
     integrate_reflection_table(reflection_table,
                                experiment,
@@ -402,6 +439,161 @@ namespace dials { namespace algorithms { namespace boost_python {
                                                     profile_params_3d_ibix);
   }
 
+  /*
+   * profile_3d_profilelib on plain arrays, for tests. Voxels indexed
+   * (ix * ny + iy) * nz + iz; a shape is (alpha, beta, sigma, sig_x, sig_y,
+   * sig_p, drift_x, drift_y) and a position (x, y, t).
+   */
+  Profile3DData make_profile_3d_data(int nx,
+                                     int ny,
+                                     int x0,
+                                     int y0,
+                                     scitbx::af::shared<double> tof,
+                                     scitbx::af::shared<double> value,
+                                     scitbx::af::shared<double> gain,
+                                     scitbx::af::shared<double> background,
+                                     scitbx::af::shared<double> extra_variance,
+                                     double background_level_variance) {
+    Profile3DData d;
+    d.nx = nx;
+    d.ny = ny;
+    d.nz = tof.size();
+    for (int ix = 0; ix < nx; ++ix)
+      d.x.push_back(x0 + ix + 0.5);
+    for (int iy = 0; iy < ny; ++iy)
+      d.y.push_back(y0 + iy + 0.5);
+    d.t.assign(tof.begin(), tof.end());
+    d.value.assign(value.begin(), value.end());
+    d.gain.assign(gain.begin(), gain.end());
+    d.background.assign(background.begin(), background.end());
+    d.extra_variance.assign(extra_variance.begin(), extra_variance.end());
+    d.background_level_variance = background_level_variance;
+    DIALS_ASSERT(d.consistent());
+    return d;
+  }
+
+  Profile3DShape shape_from_tuple(tuple s) {
+    DIALS_ASSERT(len(s) == 8);
+    Profile3DShape shape;
+    shape.alpha = extract<double>(s[0]);
+    shape.beta = extract<double>(s[1]);
+    shape.sigma = extract<double>(s[2]);
+    shape.sig_x = extract<double>(s[3]);
+    shape.sig_y = extract<double>(s[4]);
+    shape.sig_p = extract<double>(s[5]);
+    shape.drift_x = extract<double>(s[6]);
+    shape.drift_y = extract<double>(s[7]);
+    shape.valid = true;
+    return shape;
+  }
+
+  Profile3DPosition position_from_tuple(tuple p) {
+    DIALS_ASSERT(len(p) == 3);
+    Profile3DPosition position;
+    position.x = extract<double>(p[0]);
+    position.y = extract<double>(p[1]);
+    position.t = extract<double>(p[2]);
+    return position;
+  }
+
+  dict fit_result_as_dict(const Profile3DFitResult& r) {
+    dict out;
+    out["success"] = r.success;
+    out["intensity"] = r.intensity;
+    out["variance"] = r.variance;
+    out["correlation"] = r.correlation;
+    out["chi2"] = r.chi2;
+    out["shape"] = make_tuple(r.shape.alpha,
+                              r.shape.beta,
+                              r.shape.sigma,
+                              r.shape.sig_x,
+                              r.shape.sig_y,
+                              r.shape.sig_p,
+                              r.shape.drift_x,
+                              r.shape.drift_y);
+    out["position"] = make_tuple(r.position.x, r.position.y, r.position.t);
+    return out;
+  }
+
+  scitbx::af::shared<double> profile_3d_profilelib_profile_wrapper(
+    int nx,
+    int ny,
+    int x0,
+    int y0,
+    scitbx::af::shared<double> tof,
+    tuple shape,
+    tuple position) {
+    std::size_t n = nx * ny * tof.size();
+    scitbx::af::shared<double> zeros(n, 0.0);
+    Profile3DData d =
+      make_profile_3d_data(nx, ny, x0, y0, tof, zeros, zeros, zeros, zeros, 0.0);
+    std::vector<double> out;
+    bool ok = profile_3d_profilelib_detail::model(
+      d, shape_from_tuple(shape), position_from_tuple(position), out);
+    DIALS_ASSERT(ok);
+    scitbx::af::shared<double> result(out.size(), 0.0);
+    std::copy(out.begin(), out.end(), result.begin());
+    return result;
+  }
+
+  dict fit_profile_3d_profilelib_wrapper(int nx,
+                                         int ny,
+                                         int x0,
+                                         int y0,
+                                         scitbx::af::shared<double> tof,
+                                         scitbx::af::shared<double> value,
+                                         scitbx::af::shared<double> gain,
+                                         scitbx::af::shared<double> background,
+                                         scitbx::af::shared<double> extra_variance,
+                                         double background_level_variance,
+                                         const TOFProfile3DProfilelibParams& params,
+                                         dict options) {
+    // options: shape (without it, every parameter is fitted), seed,
+    // tolerance, fix_position, scatter (broadens the shape)
+    object shape = options.get("shape");
+    object seed = options.get("seed");
+    object tolerance = options.get("tolerance");
+    object scatter = options.get("scatter");
+    bool fix_position = extract<bool>(options.get("fix_position", false));
+    Profile3DData d = make_profile_3d_data(nx,
+                                           ny,
+                                           x0,
+                                           y0,
+                                           tof,
+                                           value,
+                                           gain,
+                                           background,
+                                           extra_variance,
+                                           background_level_variance);
+    if (shape.is_none()) {
+      return fit_result_as_dict(
+        fit_profile_3d_profilelib_shape(d, params, params.library_min_corr));
+    }
+    Profile3DPosition seed_position, tolerance_position;
+    const Profile3DPosition* seed_ptr = nullptr;
+    const Profile3DPosition* tolerance_ptr = nullptr;
+    if (!seed.is_none()) {
+      seed_position = position_from_tuple(extract<tuple>(seed));
+      seed_ptr = &seed_position;
+    }
+    if (!tolerance.is_none()) {
+      tolerance_position = position_from_tuple(extract<tuple>(tolerance));
+      tolerance_ptr = &tolerance_position;
+    }
+    Profile3DShape fixed_shape = shape_from_tuple(extract<tuple>(shape));
+    if (!scatter.is_none()) {
+      fixed_shape = broaden_profile_3d_shape(
+        fixed_shape, position_from_tuple(extract<tuple>(scatter)));
+    }
+    if (fix_position) {
+      DIALS_ASSERT(seed_ptr != nullptr);
+      return fit_result_as_dict(
+        fit_profile_3d_profilelib_fixed(d, fixed_shape, *seed_ptr));
+    }
+    return fit_result_as_dict(
+      fit_profile_3d_profilelib_forced(d, fixed_shape, seed_ptr, tolerance_ptr));
+  }
+
   BOOST_PYTHON_MODULE(dials_algorithms_tof_integration_ext) {
     class_<TOFProfile1DProfilelibParams>("TOFProfile1DProfilelibParams", no_init)
       .def("__init__", make_constructor(&make_TOFProfile1DProfilelibParams))
@@ -409,6 +601,16 @@ namespace dials { namespace algorithms { namespace boost_python {
                      &TOFProfile1DProfilelibParams::library_min_i_sigma)
       .def_readwrite("library_min_corr",
                      &TOFProfile1DProfilelibParams::library_min_corr);
+
+    class_<TOFProfile3DProfilelibParams, std::shared_ptr<TOFProfile3DProfilelibParams>>(
+      "TOFProfile3DProfilelibParams", no_init)
+      .def("__init__", make_constructor(&make_TOFProfile3DProfilelibParams))
+      .def_readwrite("library_min_i_sigma",
+                     &TOFProfile3DProfilelibParams::library_min_i_sigma)
+      .def_readwrite("library_min_corr",
+                     &TOFProfile3DProfilelibParams::library_min_corr)
+      .def_readwrite("position_tolerance",
+                     &TOFProfile3DProfilelibParams::position_tolerance);
 
     class_<TOFProfile1DIBIXParams>("TOFProfile1DIBIXParams", no_init)
       .def(init<double,
@@ -536,6 +738,31 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("min_iterations"),
          arg("n_threads") = 1));
 
+    def("profile_3d_profilelib_profile",
+        &profile_3d_profilelib_profile_wrapper,
+        (arg("nx"),
+         arg("ny"),
+         arg("x0"),
+         arg("y0"),
+         arg("tof"),
+         arg("shape"),
+         arg("position")));
+
+    def("fit_profile_3d_profilelib",
+        &fit_profile_3d_profilelib_wrapper,
+        (arg("nx"),
+         arg("ny"),
+         arg("x0"),
+         arg("y0"),
+         arg("tof"),
+         arg("value"),
+         arg("gain"),
+         arg("background"),
+         arg("extra_variance"),
+         arg("background_level_variance"),
+         arg("params"),
+         arg("options") = dict()));
+
     def("integrate_reflection_table",
         &integrate_reflection_table_wrapper,
         (arg("reflection_table"),
@@ -551,7 +778,8 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("profile_3d_ic_params") = object(),
          arg("profile_3d_ibix_params") = object(),
          arg("profile_1d_profilelib_params") = object(),
-         arg("lorentz_wavelength_power") = 4.0));
+         arg("lorentz_wavelength_power") = 4.0,
+         arg("profile_3d_profilelib_params") = object()));
 
     def("calculate_line_profile_for_reflection",
         &calculate_line_profile_for_reflection_wrapper,

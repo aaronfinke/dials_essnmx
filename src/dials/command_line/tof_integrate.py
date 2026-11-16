@@ -37,6 +37,7 @@ from dials_algorithms_tof_integration_ext import (
     TOFProfile3DGutmannParams,
     TOFProfile3DIBIXParams,
     TOFProfile3DICParams,
+    TOFProfile3DProfilelibParams,
     integrate_reflection_table,
     tof_calculate_ellipse_shoebox_mask,
     tof_calculate_seed_skewness_shoebox_mask,
@@ -80,7 +81,7 @@ calculated{
     .help = "The resolution spots are integrated to when using integration_type.calculated"
 
 }
-method = *summation profile_1d_ibix profile_1d_profilelib profile_1d_ic profile_3d_gutmann profile_3d_ic profile_3d_ibix
+method = *summation profile_1d_ibix profile_1d_profilelib profile_1d_ic profile_3d_gutmann profile_3d_ic profile_3d_ibix profile_3d_profilelib
     .type = choice
     .help = "Integration method: "
             "summation: shoebox summation"
@@ -94,7 +95,10 @@ method = *summation profile_1d_ibix profile_1d_profilelib profile_1d_ic profile_
             "profile_3d_ic: separable Ikeda-Carpenter x bivariate Gaussian model, "
             "https://doi.org/10.1016/0168-9002(85)90033-6"
             "profile_3d_ibix: separable iBIX x bivariate Gaussian model, "
-            "https://doi.org/10.1038/srep36628"
+            "https://doi.org/10.1038/srep36628 "
+            "profile_3d_profilelib: profile_3d_ibix's model, with the shape"
+            "taken from a library measured on strong reflections, as"
+            "profile_1d_profilelib does for the ToF line shape alone"
 
 mask = *ellipse seed_skewness
     .type = choice
@@ -444,6 +448,94 @@ profile_3d_ibix{
         .help = "Scales the per-reflection dXdt/dYdt bounds relative to the "
                 "shoebox's spatial extent divided by its ToF extent"
 }
+profile_3d_profilelib
+    .help = "3D profile fitting against a library of peak shapes measured on"
+            "strong reflections. The model is profile_3d_ibix's: the iBIX line"
+            "shape in ToF times a bivariate Gaussian on the detector face,"
+            "whose centre may drift linearly with ToF. Every parameter is"
+            "fitted on reflections strong enough to determine it; every"
+            "reflection is then fitted with the shape of the nearest of"
+            "those held fixed, and only its amplitude and position free."
+            "ToF is in us, as in profile_1d_profilelib, so alpha and beta"
+            "are in 1/us and take that method's bounds."
+{
+    init_alpha = 0.03
+        .type = float
+        .help = "Initial alpha (1/us) of a shape fit"
+    min_alpha = 1e-5
+        .type = float
+        .help = "Min alpha (1/us)"
+    max_alpha = 10.0
+        .type = float
+        .help = "Max alpha (1/us)"
+    init_beta = 0.03
+        .type = float
+        .help = "Initial beta (1/us) of a shape fit"
+    min_beta = 1e-5
+        .type = float
+        .help = "Min beta (1/us). Not zero: beta = 0 makes the profile"
+                "identically zero."
+    max_beta = 10.0
+        .type = float
+        .help = "Max beta (1/us)"
+    min_sig_x = 0.2
+        .type = float
+        .help = "Min bivariate Gaussian sigma x (px)"
+    max_sig_x = 20.0
+        .type = float
+        .help = "Max bivariate Gaussian sigma x (px)"
+    min_sig_y = 0.2
+        .type = float
+        .help = "Min bivariate Gaussian sigma y (px)"
+    max_sig_y = 20.0
+        .type = float
+        .help = "Max bivariate Gaussian sigma y (px)"
+    min_sig_p = -0.95
+        .type = float
+        .help = "Min bivariate Gaussian correlation"
+    max_sig_p = 0.95
+        .type = float
+        .help = "Max bivariate Gaussian correlation"
+    max_drift_factor = 1.5
+        .type = float(value_min=0)
+        .help = "Bound on how fast the peak centre may move across the"
+                "detector with ToF: this times the box's extent in pixels"
+                "over its extent in ToF. 0 holds the centre fixed."
+    n_restarts = 10
+        .type = int(value_min=0)
+        .help = "If a shape fit fails, number of further attempts from"
+                "perturbed starting points"
+    free_position_min_i_sigma = 10.0
+        .type = float
+        .help = "A reflection is first fitted at its prediction, corrected by"
+                "the median offset the library measured on its panel, with"
+                "only the amplitude free and the shape broadened by how far"
+                "the library's own peaks scatter about their predictions. A"
+                "weak peak's counts cannot place it: a position fitted to"
+                "them finds the brightest noise and reads the intensity high."
+                "Where that first fit reaches this I/sigma the position is"
+                "fitted as well, with the unbroadened shape. Only applies"
+                "where the table holds predictions (xyzcal.px and tof_cal);"
+                "otherwise every position is fitted."
+    position_tolerance = 3.0
+        .type = float(value_min=0)
+        .help = "How far a fitted position may move from the expected one:"
+                "this many times the scatter of the library's own offsets"
+                "(at least 1 px on the detector and one ToF bin)."
+    library{
+        min_i_sigma = 10.0
+            .type = float(value_min=0)
+            .help = "Summation I/sigma a reflection must reach for its fitted"
+                    "shape to enter the library. Higher than"
+                    "profile_1d_profilelib's, because a 3D shape has eight"
+                    "parameters to determine rather than three."
+        min_correlation = 0.5
+            .type = float(value_min=0, value_max=1)
+            .help = "Correlation between model and data, over the voxels where"
+                    "the model reaches 5% of its maximum, that a shape fit"
+                    "must reach to enter the library."
+    }
+}
 
 mp{
     nproc = auto
@@ -592,6 +684,7 @@ def integrate_reflection_table_for_experiment(
     profile_3d_gutmann_params = None
     profile_3d_ic_params = None
     profile_3d_ibix_params = None
+    profile_3d_profilelib_params = None
     incident_params = None
     absorption_params = None
 
@@ -759,6 +852,42 @@ def integrate_reflection_table_for_experiment(
                 "show_profile_failures": show_profile_failures,
             }
         )
+    elif params.method == "profile_3d_profilelib":
+        p = params.profile_3d_profilelib
+        for name in ("alpha", "beta", "sig_x", "sig_y", "sig_p"):
+            if getattr(p, f"min_{name}") >= getattr(p, f"max_{name}"):
+                raise ValueError(
+                    f"profile_3d_profilelib.min_{name} must be below max_{name}"
+                )
+        logger.info(
+            "    Measuring 3D peak shapes on reflections with I/sigma >= "
+            f"{p.library.min_i_sigma} whose fit correlates >= "
+            f"{p.library.min_correlation}, then holding them fixed elsewhere"
+        )
+        # dict needed due to boost limit of 15 template arguments
+        profile_3d_profilelib_params = TOFProfile3DProfilelibParams(
+            {
+                "alpha": p.init_alpha,
+                "alpha_min": p.min_alpha,
+                "alpha_max": p.max_alpha,
+                "beta": p.init_beta,
+                "beta_min": p.min_beta,
+                "beta_max": p.max_beta,
+                "SigX_min": p.min_sig_x,
+                "SigX_max": p.max_sig_x,
+                "SigY_min": p.min_sig_y,
+                "SigY_max": p.max_sig_y,
+                "SigP_min": p.min_sig_p,
+                "SigP_max": p.max_sig_p,
+                "max_drift_factor": p.max_drift_factor,
+                "n_restarts": p.n_restarts,
+                "show_profile_failures": show_profile_failures,
+                "library_min_i_sigma": p.library.min_i_sigma,
+                "library_min_corr": p.library.min_correlation,
+                "position_tolerance": p.position_tolerance,
+                "free_position_min_i_sigma": p.free_position_min_i_sigma,
+            }
+        )
 
     if apply_lorentz:
         logger.info("    Adding Lorentz correction")
@@ -792,6 +921,7 @@ def integrate_reflection_table_for_experiment(
         profile_3d_ibix_params,
         profile_1d_profilelib_params,
         params.corrections.lorentz_wavelength_power,
+        profile_3d_profilelib_params=profile_3d_profilelib_params,
     )
 
     return expt_reflections

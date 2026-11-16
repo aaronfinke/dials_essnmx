@@ -23,9 +23,11 @@
 #include <dials/algorithms/integration/tof/tof_profile_3d_gutmann.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_ic.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_ibix.h>
+#include <dials/algorithms/integration/tof/tof_profile_3d_profilelib.h>
 #include <dials/algorithms/scaling/tof/tof_scaling.h>
 #include <dials/util/thread_pool.h>
 #include <atomic>
+#include <map>
 #include <chrono>
 #include <mutex>
 #include <vector>
@@ -195,6 +197,12 @@ namespace dials { namespace algorithms {
     double var_I = 0;
     double var_B = 0;
     double I_raw = 0;
+    // What one raw count adds to I, and the part of var_I that is not the
+    // counting error of the signal and background counts (from the incident
+    // and empty spectra). A fit that weights voxels by the counts its model
+    // expects needs both.
+    double gain = 0;
+    double var_extra = 0;
   };
 
   class PixelCorrector {
@@ -288,6 +296,7 @@ namespace dials { namespace algorithms {
 
       double I0, var_I0, I_raw, B, var_B_pre;
       double J = 1.0, var_J = 0.0;
+      double count_scale = 1.0;  // I0 per raw count
 
       // Bin-width normalisation is applied to the incident spectrum
       if (!has_incident) {
@@ -344,6 +353,7 @@ namespace dials { namespace algorithms {
         var_B_pre = var_Bn;
         J = Jn;
         var_J = var_Jn;
+        count_scale = 1.0 / sample_pc;
       }
 
       // Apply the Lorentz correction and normalise
@@ -355,7 +365,13 @@ namespace dials { namespace algorithms {
         (L * L / (JT * JT)) * var_I0 + (L * L * I0 * I0 / (JT * JT * J * J)) * var_J;
       out.var_B =
         (L * L / (JT * JT)) * var_B_pre + (L * L * B * B / (JT * JT * J * J)) * var_J;
+      out.gain = L * count_scale / JT;
+      out.var_extra = std::max(out.var_I - out.gain * out.gain * (var_S + var_B), 0.0);
       return true;
+    }
+
+    int n_background() const {
+      return n_background_;
     }
 
   private:
@@ -382,6 +398,21 @@ namespace dials { namespace algorithms {
     scitbx::af::versa<double, af::c_grid<3>> intensity_3d;
     scitbx::af::versa<double, af::c_grid<3>> background_var_3d;
     scitbx::af::versa<vec3<double>, af::c_grid<3>> coords_3d;
+
+    /*
+     * For fits that weight each voxel by the counts their model expects
+     * there (profile_3d_profilelib), indexed as intensity_3d: the corrected
+     * value of one raw count (0 where the voxel is not valid or could not be
+     * corrected), the background in raw counts, and the variance from the
+     * incident and empty spectra. n_background is the number of pixels the
+     * background was estimated from, and (x0, y0) the first pixel of the box.
+     */
+    scitbx::af::versa<double, af::c_grid<3>> gain_3d;
+    scitbx::af::versa<double, af::c_grid<3>> raw_background_3d;
+    scitbx::af::versa<double, af::c_grid<3>> extra_var_3d;
+    int n_background = 0;
+    int x0 = 0;
+    int y0 = 0;
   };
 
   // Second pass over a shoebox
@@ -404,6 +435,13 @@ namespace dials { namespace algorithms {
     result.intensity_3d = scitbx::af::versa<double, af::c_grid<3>>(transposed_acc);
     result.background_var_3d = scitbx::af::versa<double, af::c_grid<3>>(transposed_acc);
     result.coords_3d = scitbx::af::versa<vec3<double>, af::c_grid<3>>(transposed_acc);
+    result.gain_3d = scitbx::af::versa<double, af::c_grid<3>>(transposed_acc, 0.0);
+    result.raw_background_3d =
+      scitbx::af::versa<double, af::c_grid<3>>(transposed_acc, 0.0);
+    result.extra_var_3d = scitbx::af::versa<double, af::c_grid<3>>(transposed_acc, 0.0);
+    result.n_background = corrector.n_background();
+    result.x0 = shoebox.xoffset();
+    result.y0 = shoebox.yoffset();
 
     int panel = shoebox.panel;
 
@@ -448,6 +486,11 @@ namespace dials { namespace algorithms {
 
           result.intensity_3d(x, y, z) = pixel.I;
           result.background_var_3d(x, y, z) = pixel.var_B;
+          if ((mask & Valid) == Valid) {
+            result.gain_3d(x, y, z) = pixel.gain;
+          }
+          result.raw_background_3d(x, y, z) = raw_B;
+          result.extra_var_3d(x, y, z) = pixel.var_extra;
           double x_c = x + shoebox.xoffset() + 0.5;
           double y_c = y + shoebox.yoffset() + 0.5;
           double z_c = z + shoebox.zoffset() + 0.5;
@@ -485,6 +528,64 @@ namespace dials { namespace algorithms {
     double y = 0.0;
     IBIXShape shape;
   };
+
+  // Where a reflection is predicted to be, and where its shoebox starts
+  struct ReflectionGeometry {
+    double x_cal = 0.0;  // px
+    double y_cal = 0.0;
+    double tof_cal = 0.0;  // us
+    int x0 = 0;            // first pixel of the bounding box
+    int y0 = 0;
+  };
+
+  /*
+   * The voxels of a shoebox as profile_3d_profilelib fits them (see
+   * tof_profile_3d_profilelib.h).
+   */
+  inline Profile3DData profile_3d_data(const ShoeboxIntegrationResult& r) {
+    Profile3DData d;
+    d.nx = r.intensity_3d.accessor()[0];
+    d.ny = r.intensity_3d.accessor()[1];
+    d.nz = r.intensity_3d.accessor()[2];
+    d.x.resize(d.nx);
+    d.y.resize(d.ny);
+    for (std::size_t ix = 0; ix < d.nx; ++ix) {
+      d.x[ix] = r.x0 + ix + 0.5;
+    }
+    for (std::size_t iy = 0; iy < d.ny; ++iy) {
+      d.y[iy] = r.y0 + iy + 0.5;
+    }
+    d.t.assign(r.tof_z.begin(), r.tof_z.end());
+    const std::size_t n = d.size();
+    d.value.resize(n);
+    d.gain.resize(n);
+    d.background.resize(n);
+    d.extra_variance.resize(n);
+    double background_total = 0.0;
+    std::size_t n_used = 0;
+    for (std::size_t ix = 0; ix < d.nx; ++ix) {
+      for (std::size_t iy = 0; iy < d.ny; ++iy) {
+        for (std::size_t iz = 0; iz < d.nz; ++iz) {
+          std::size_t i = d.index(ix, iy, iz);
+          d.value[i] = r.intensity_3d(ix, iy, iz);
+          d.gain[i] = r.gain_3d(ix, iy, iz);
+          d.background[i] = r.raw_background_3d(ix, iy, iz);
+          d.extra_variance[i] = r.extra_var_3d(ix, iy, iz);
+          if (d.usable(i)) {
+            background_total += std::max(d.background[i], 0.0);
+            ++n_used;
+          }
+        }
+      }
+    }
+    // The background level is estimated from n_background pixels, so an error
+    // in it common to every voxel has variance about the mean background
+    // count over n_background (exactly that for a constant background)
+    if (n_used > 0 && r.n_background > 0) {
+      d.background_level_variance = background_total / n_used / r.n_background;
+    }
+    return d;
+  }
 
   /*
    * Variance of a profile-fitted intensity.
@@ -562,11 +663,17 @@ namespace dials { namespace algorithms {
       return false;
     }
 
-    // Pass one: offer a reflection as a candidate library entry
+    // Pass one: offer a reflection as a candidate library entry. geometry,
+    // where the table holds predictions, says where the reflection was
+    // predicted to be.
     virtual void collect(const ShoeboxIntegrationResult& shoebox_result,
                          int panel,
                          double x,
-                         double y) {}
+                         double y,
+                         const ReflectionGeometry* geometry = nullptr) {}
+
+    // Called once, when pass one is complete and the library will not change
+    virtual void finalise_library() {}
 
     // Pass two: fit with the shape taken from the library
     virtual bool fit_with_library(const ShoeboxIntegrationResult& shoebox_result,
@@ -574,7 +681,8 @@ namespace dials { namespace algorithms {
                                   double x,
                                   double y,
                                   double& I_prf,
-                                  double& var_prf) {
+                                  double& var_prf,
+                                  const ReflectionGeometry* geometry = nullptr) {
       return fit(shoebox_result, I_prf, var_prf);
     }
 
@@ -633,7 +741,8 @@ namespace dials { namespace algorithms {
     void collect(const ShoeboxIntegrationResult& shoebox_result,
                  int panel,
                  double x,
-                 double y) override {
+                 double y,
+                 const ReflectionGeometry* geometry = nullptr) override {
       if (!shoebox_result.success || !(shoebox_result.variance > 0.0)) {
         return;
       }
@@ -675,7 +784,8 @@ namespace dials { namespace algorithms {
                           double x,
                           double y,
                           double& I_prf,
-                          double& var_prf) override {
+                          double& var_prf,
+                          const ReflectionGeometry* geometry = nullptr) override {
       var_prf = shoebox_result.variance;
       const ProfileLibraryEntry* entry = nearest(panel, x, y);
       if (entry == nullptr) {
@@ -748,6 +858,252 @@ namespace dials { namespace algorithms {
     double min_corr_;
     std::vector<ProfileLibraryEntry> library_;
     mutable std::mutex mutex_;
+  };
+
+  /*
+   * profile_3d_profilelib: profile_3d_ibix's model with the shape taken from a
+   * library, as profile_1d_profilelib does for the line shape alone (see
+   * tof_profile_3d_profilelib.h for the model and the fits).
+   *
+   * Pass one fits every parameter to the reflections strong enough to
+   * determine them and keeps each shape against where it was measured, with
+   * how far the fitted peak sat from its prediction. Pass two fits every
+   * reflection with the shape of the nearest library entry held fixed, and
+   * only the amplitude and the position free.
+   *
+   * Where the table holds predictions, a reflection is expected at its
+   * prediction corrected by the median offset the library measured on the
+   * same panel (or over the whole detector, where a panel holds few
+   * entries). It is first fitted there, with only the amplitude free and the
+   * shape broadened by the scatter of individual offsets about those medians.
+   * A weak peak's own counts cannot place it, and a position fitted to them
+   * goes wherever the noise is brightest: on simulated peaks of 30 counts that
+   * read the intensity 45% high. Where the fit at the expected position
+   * reaches free_position_min_i_sigma, the counts can place the peak, and it
+   * is refitted with the unbroadened shape and the position free within
+   * position_tolerance scatters of the expected one.
+   *
+   * Without predictions every reflection is fitted with its position free
+   * anywhere in the box.
+   */
+  class Profile3DProfilelibFitter : public ProfileFitter {
+  public:
+    struct Entry {
+      int panel = 0;
+      double x = 0.0;  // where it was measured: the centre of its box (px)
+      double y = 0.0;
+      Profile3DShape shape;
+      bool has_offset = false;
+      double dx = 0.0;  // fitted minus predicted position (px, px, us)
+      double dy = 0.0;
+      double dt = 0.0;
+    };
+
+    explicit Profile3DProfilelibFitter(TOFProfile3DProfilelibParams params)
+        : params_(params) {}
+
+    bool needs_two_passes() const override {
+      return true;
+    }
+
+    void collect(const ShoeboxIntegrationResult& shoebox_result,
+                 int panel,
+                 double x,
+                 double y,
+                 const ReflectionGeometry* geometry = nullptr) override {
+      if (!shoebox_result.success || !(shoebox_result.variance > 0.0)) {
+        return;
+      }
+      double i_sigma = shoebox_result.intensity / std::sqrt(shoebox_result.variance);
+      if (!(i_sigma >= params_.library_min_i_sigma)) {
+        return;
+      }
+      Profile3DFitResult fit = fit_profile_3d_profilelib_shape(
+        profile_3d_data(shoebox_result), params_, params_.library_min_corr);
+      if (!fit.success || !fit.shape.valid) {
+        return;
+      }
+
+      Entry entry;
+      entry.panel = panel;
+      entry.x = x;
+      entry.y = y;
+      entry.shape = fit.shape;
+      if (geometry != nullptr) {
+        entry.has_offset = true;
+        entry.dx = fit.position.x - geometry->x_cal;
+        entry.dy = fit.position.y - geometry->y_cal;
+        entry.dt = fit.position.t - geometry->tof_cal;
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      library_.push_back(entry);
+    }
+
+    void finalise_library() override {
+      namespace detail = profile_3d_profilelib_detail;
+      std::lock_guard<std::mutex> lock(mutex_);
+      have_offsets_ = false;
+      panel_offsets_.clear();
+
+      std::map<int, std::vector<const Entry*>> by_panel;
+      std::vector<const Entry*> all;
+      for (const auto& e : library_) {
+        if (e.has_offset) {
+          by_panel[e.panel].push_back(&e);
+          all.push_back(&e);
+        }
+      }
+      if (all.empty()) {
+        return;
+      }
+      global_offset_ = median_offset(all);
+      for (const auto& item : by_panel) {
+        if (item.second.size() >= min_entries_per_panel_) {
+          panel_offsets_[item.first] = median_offset(item.second);
+        }
+      }
+      std::vector<double> rx, ry, rt;
+      for (const Entry* e : all) {
+        const Profile3DPosition& o = offset_for(e->panel);
+        rx.push_back(e->dx - o.x);
+        ry.push_back(e->dy - o.y);
+        rt.push_back(e->dt - o.t);
+      }
+      scatter_.x = detail::robust_sd(rx);
+      scatter_.y = detail::robust_sd(ry);
+      scatter_.t = detail::robust_sd(rt);
+      have_offsets_ = true;
+      std::cout << "      library offsets from prediction scatter by " << scatter_.x
+                << " px, " << scatter_.y << " px, " << scatter_.t << " us" << std::endl;
+    }
+
+    bool fit_with_library(const ShoeboxIntegrationResult& shoebox_result,
+                          int panel,
+                          double x,
+                          double y,
+                          double& I_prf,
+                          double& var_prf,
+                          const ReflectionGeometry* geometry = nullptr) override {
+      var_prf = shoebox_result.variance;
+      const Entry* entry = nearest(panel, x, y);
+      if (entry == nullptr) {
+        return false;
+      }
+      Profile3DData d = profile_3d_data(shoebox_result);
+      Profile3DFitResult result;
+      if (geometry != nullptr && have_offsets_ && d.nz > 1) {
+        const Profile3DPosition& o = offset_for(panel);
+        Profile3DPosition seed;
+        seed.x = geometry->x_cal + o.x;
+        seed.y = geometry->y_cal + o.y;
+        seed.t = geometry->tof_cal + o.t;
+
+        // At the expected position, with the shape broadened by how
+        // uncertain that position is
+        result = fit_profile_3d_profilelib_fixed(
+          d, broaden_profile_3d_shape(entry->shape, scatter_), seed);
+
+        // Where that finds a peak strong enough to place, place it
+        if (result.success && result.variance > 0.0
+            && result.intensity / std::sqrt(result.variance)
+                 >= params_.free_position_min_i_sigma) {
+          double mean_dt = (d.t.back() - d.t.front()) / (d.nz - 1);
+          Profile3DPosition tolerance;
+          tolerance.x = std::max(params_.position_tolerance * scatter_.x, 1.0);
+          tolerance.y = std::max(params_.position_tolerance * scatter_.y, 1.0);
+          tolerance.t = std::max(params_.position_tolerance * scatter_.t, mean_dt);
+          Profile3DFitResult placed =
+            fit_profile_3d_profilelib_forced(d, entry->shape, &seed, &tolerance);
+          if (placed.success) {
+            result = placed;
+          }
+        }
+      } else {
+        // No prediction to start from: the position comes from the data
+        result = fit_profile_3d_profilelib_forced(d, entry->shape);
+      }
+      if (!result.success) {
+        return false;
+      }
+      I_prf = result.intensity;
+      var_prf = result.variance;
+      return true;
+    }
+
+    // A free fit of the reflection on its own, for use without a library
+    bool fit(const ShoeboxIntegrationResult& shoebox_result,
+             double& I_prf,
+             double& var_prf) override {
+      var_prf = shoebox_result.variance;
+      Profile3DFitResult result = fit_profile_3d_profilelib_shape(
+        profile_3d_data(shoebox_result), params_, params_.library_min_corr);
+      if (!result.success) {
+        return false;
+      }
+      I_prf = result.intensity;
+      var_prf = result.variance;
+      return true;
+    }
+
+    std::size_t library_size() const override {
+      return library_.size();
+    }
+
+  private:
+    const Entry* nearest(int panel, double x, double y) const {
+      const Entry* best = nullptr;
+      double best_d2 = std::numeric_limits<double>::infinity();
+      // Prefer the same panel; fall back to any panel if it holds no shapes
+      for (int same_panel = 1; same_panel >= 0; --same_panel) {
+        for (const auto& e : library_) {
+          if (same_panel && e.panel != panel) {
+            continue;
+          }
+          double dx = e.x - x;
+          double dy = e.y - y;
+          double d2 = dx * dx + dy * dy;
+          if (d2 < best_d2) {
+            best_d2 = d2;
+            best = &e;
+          }
+        }
+        if (best != nullptr) {
+          break;
+        }
+      }
+      return best;
+    }
+
+    static Profile3DPosition median_offset(const std::vector<const Entry*>& entries) {
+      namespace detail = profile_3d_profilelib_detail;
+      std::vector<double> dx, dy, dt;
+      for (const Entry* e : entries) {
+        dx.push_back(e->dx);
+        dy.push_back(e->dy);
+        dt.push_back(e->dt);
+      }
+      Profile3DPosition o;
+      o.x = detail::median(dx);
+      o.y = detail::median(dy);
+      o.t = detail::median(dt);
+      return o;
+    }
+
+    const Profile3DPosition& offset_for(int panel) const {
+      std::map<int, Profile3DPosition>::const_iterator it = panel_offsets_.find(panel);
+      return it != panel_offsets_.end() ? it->second : global_offset_;
+    }
+
+    TOFProfile3DProfilelibParams params_;
+    std::vector<Entry> library_;
+    mutable std::mutex mutex_;
+
+    // Set by finalise_library
+    const std::size_t min_entries_per_panel_ = 10;
+    bool have_offsets_ = false;
+    Profile3DPosition global_offset_;
+    std::map<int, Profile3DPosition> panel_offsets_;
+    Profile3DPosition scatter_;
   };
 
   class Profile1DICFitter : public ProfileFitter {
@@ -912,6 +1268,28 @@ namespace dials { namespace algorithms {
     std::atomic<std::size_t> n_prf_ok(0);
     std::atomic<std::size_t> n_collected(0);
 
+    // Predicted positions, where the table has them, for fitters that compare
+    // a fitted peak position with its prediction
+    bool have_predictions =
+      reflection_table.contains("xyzcal.px") && reflection_table.contains("tof_cal");
+    dials::af::shared<vec3<double>> xyzcal_px;
+    dials::af::shared<double> tof_cal;
+    if (have_predictions) {
+      xyzcal_px = reflection_table["xyzcal.px"];
+      tof_cal = reflection_table["tof_cal"];
+    }
+    auto reflection_geometry = [&](std::size_t i, const int6& bbox) {
+      ReflectionGeometry g;
+      if (have_predictions) {
+        g.x_cal = xyzcal_px[i][0];
+        g.y_cal = xyzcal_px[i][1];
+        g.tof_cal = tof_cal[i];
+        g.x0 = bbox[0];
+        g.y0 = bbox[2];
+      }
+      return g;
+    };
+
     // Pass one, when the fitter builds a library: measure shapes on the strong
     // reflections before anything is fitted against them
     auto shape_worker = [&](std::size_t start, std::size_t end) {
@@ -956,7 +1334,9 @@ namespace dials { namespace algorithms {
         if (shoebox_result.success) {
           double cx = 0.5 * (bbox[0] + bbox[1]);
           double cy = 0.5 * (bbox[2] + bbox[3]);
-          profile_fitter->collect(shoebox_result, shoebox.panel, cx, cy);
+          ReflectionGeometry g = reflection_geometry(i, bbox);
+          profile_fitter->collect(
+            shoebox_result, shoebox.panel, cx, cy, have_predictions ? &g : nullptr);
         }
         ++n_collected;
       }
@@ -1012,8 +1392,15 @@ namespace dials { namespace algorithms {
             if (profile_fitter->needs_two_passes()) {
               double cx = 0.5 * (bbox[0] + bbox[1]);
               double cy = 0.5 * (bbox[2] + bbox[3]);
-              profile_success = profile_fitter->fit_with_library(
-                shoebox_result, shoebox.panel, cx, cy, I_prf, var_prf);
+              ReflectionGeometry g = reflection_geometry(i, bbox);
+              profile_success =
+                profile_fitter->fit_with_library(shoebox_result,
+                                                 shoebox.panel,
+                                                 cx,
+                                                 cy,
+                                                 I_prf,
+                                                 var_prf,
+                                                 have_predictions ? &g : nullptr);
             } else {
               profile_success = profile_fitter->fit(shoebox_result, I_prf, var_prf);
             }
@@ -1051,6 +1438,7 @@ namespace dials { namespace algorithms {
       shape_pool.wait();
       std::cout << "      profile library holds " << profile_fitter->library_size()
                 << " shapes from " << n_reflections << " reflections" << std::endl;
+      profile_fitter->finalise_library();
     }
 
     dials::util::ThreadPool pool(n_threads);
