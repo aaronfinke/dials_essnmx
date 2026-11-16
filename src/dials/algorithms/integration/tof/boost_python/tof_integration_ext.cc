@@ -3,6 +3,8 @@
 #include <boost/python/def.hpp>
 #include <dials/algorithms/integration/tof/tof_mask_calculator.h>
 #include <dials/algorithms/integration/tof/tof_integration.h>
+#include <dials/algorithms/integration/tof/tof_overlaps.h>
+#include <dials/algorithms/integration/tof/tof_overlap_deconvolution.h>
 #include <dials/algorithms/integration/tof/tof_profile_1d_ibix.h>
 #include <dials/algorithms/integration/tof/tof_profile_1d_ic.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_gutmann.h>
@@ -195,21 +197,24 @@ namespace dials { namespace algorithms { namespace boost_python {
                                                     b("show_profile_failures"));
   }
 
-  void integrate_reflection_table_wrapper(dials::af::reflection_table& reflection_table,
-                                          dxtbx::model::Experiment& experiment,
-                                          dxtbx::ImageSequence& data,
-                                          object incident_params_obj,
-                                          object absorption_params_obj,
-                                          const bool& apply_lorentz,
-                                          int n_threads,
-                                          object profile_1d_ibix_params_obj,
-                                          object profile_1d_ic_params_obj,
-                                          object profile_3d_gutmann_params_obj,
-                                          object profile_3d_ic_params_obj,
-                                          object profile_3d_ibix_params_obj,
-                                          object profile_1d_profilelib_params_obj,
-                                          double lorentz_wavelength_power,
-                                          object profile_3d_profilelib_params_obj) {
+  // Returns the profile fitter, or None for summation alone, so that a profile
+  // library it built outlives the call (see tof_deconvolve_overlaps)
+  std::shared_ptr<ProfileFitter> integrate_reflection_table_wrapper(
+    dials::af::reflection_table& reflection_table,
+    dxtbx::model::Experiment& experiment,
+    dxtbx::ImageSequence& data,
+    object incident_params_obj,
+    object absorption_params_obj,
+    const bool& apply_lorentz,
+    int n_threads,
+    object profile_1d_ibix_params_obj,
+    object profile_1d_ic_params_obj,
+    object profile_3d_gutmann_params_obj,
+    object profile_3d_ic_params_obj,
+    object profile_3d_ibix_params_obj,
+    object profile_1d_profilelib_params_obj,
+    double lorentz_wavelength_power,
+    object profile_3d_profilelib_params_obj) {
     boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
     boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params;
 
@@ -240,6 +245,94 @@ namespace dials { namespace algorithms { namespace boost_python {
                                n_threads,
                                profile_fitter,
                                lorentz_wavelength_power);
+    return profile_fitter;
+  }
+
+  std::size_t tof_deconvolve_overlaps_wrapper(
+    dials::af::reflection_table& reflection_table,
+    dxtbx::model::Experiment& experiment,
+    dxtbx::ImageSequence& data,
+    object incident_params_obj,
+    object absorption_params_obj,
+    const bool& apply_lorentz,
+    double lorentz_wavelength_power,
+    int n_threads,
+    std::shared_ptr<ProfileFitter> profile_fitter,
+    double intensity_scale,
+    bool replace_all) {
+    boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
+    boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params;
+    if (!incident_params_obj.is_none()) {
+      incident_params =
+        extract<dials_scaling::TOFIncidentSpectrumParams>(incident_params_obj);
+    }
+    if (!absorption_params_obj.is_none()) {
+      absorption_params =
+        extract<dials_scaling::TOFAbsorptionParams>(absorption_params_obj);
+    }
+    return tof_deconvolve_overlaps(reflection_table,
+                                   experiment,
+                                   data,
+                                   incident_params,
+                                   absorption_params,
+                                   apply_lorentz,
+                                   lorentz_wavelength_power,
+                                   n_threads,
+                                   profile_fitter,
+                                   intensity_scale,
+                                   replace_all);
+  }
+
+  /*
+   * One weighted solve for the intensities of a cluster, from a dense matrix
+   * of profiles (voxels by reflections). Returns the values and their
+   * variances; every variance is -1 if the data do not determine them.
+   */
+  boost::python::tuple fit_overlap_cluster_wrapper(
+    scitbx::af::const_ref<double, scitbx::af::c_grid<2>> profiles,
+    scitbx::af::const_ref<double> data,
+    scitbx::af::const_ref<double> variance) {
+    const std::size_t n = profiles.accessor()[0];
+    const std::size_t K = profiles.accessor()[1];
+    DIALS_ASSERT(data.size() == n && variance.size() == n);
+
+    OverlapClusterDesign design;
+    design.n_components = static_cast<int>(K);
+    for (std::size_t i = 0; i < n; ++i) {
+      for (std::size_t k = 0; k < K; ++k) {
+        if (profiles(i, k) != 0.0) {
+          design.add(static_cast<int>(k), profiles(i, k));
+        }
+      }
+      design.end_row();
+    }
+    OverlapClusterFit fit =
+      solve_overlap_cluster(design,
+                            std::vector<double>(data.begin(), data.end()),
+                            std::vector<double>(variance.begin(), variance.end()));
+
+    scitbx::af::shared<double> value(K, 0.0), value_variance(K, -1.0);
+    if (fit.success) {
+      for (std::size_t k = 0; k < K; ++k) {
+        value[k] = fit.value[k];
+        value_variance[k] = fit.covariance(k, k);
+      }
+    }
+    return boost::python::make_tuple(value, value_variance);
+  }
+
+  // The coupled pairs as two parallel arrays of reflection indices
+  boost::python::tuple tof_mask_neighbour_foreground_wrapper(
+    dials::af::reflection_table& reflection_table) {
+    std::vector<std::pair<std::size_t, std::size_t>> coupled =
+      tof_mask_neighbour_foreground(reflection_table);
+    scitbx::af::shared<std::size_t> first(coupled.size());
+    scitbx::af::shared<std::size_t> second(coupled.size());
+    for (std::size_t i = 0; i < coupled.size(); ++i) {
+      first[i] = coupled[i].first;
+      second[i] = coupled[i].second;
+    }
+    return boost::python::make_tuple(first, second);
   }
 
   void extract_correction_params(
@@ -762,6 +855,37 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("background_level_variance"),
          arg("params"),
          arg("options") = dict()));
+
+    class_<ProfileFitter, std::shared_ptr<ProfileFitter>, boost::noncopyable>(
+      "TOFProfileFitter", no_init)
+      .def("library_size", &ProfileFitter::library_size)
+      .def("library_size_xy", &ProfileFitter::library_size_xy);
+
+    def("tof_deconvolve_overlaps",
+        &tof_deconvolve_overlaps_wrapper,
+        (arg("reflection_table"),
+         arg("experiment"),
+         arg("data"),
+         arg("incident_params"),
+         arg("absorption_params"),
+         arg("apply_lorentz_correction"),
+         arg("lorentz_wavelength_power"),
+         arg("n_threads"),
+         arg("profile_fitter"),
+         arg("intensity_scale") = 1.0,
+         arg("replace_all") = false));
+
+    def("fit_overlap_cluster",
+        &fit_overlap_cluster_wrapper,
+        (arg("profiles"), arg("data"), arg("variance")));
+
+    def("tof_assign_overlap_ownership",
+        &tof_assign_overlap_ownership,
+        (arg("reflection_table")));
+
+    def("tof_mask_neighbour_foreground",
+        &tof_mask_neighbour_foreground_wrapper,
+        (arg("reflection_table")));
 
     def("integrate_reflection_table",
         &integrate_reflection_table_wrapper,
