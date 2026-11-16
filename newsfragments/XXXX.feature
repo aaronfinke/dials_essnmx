@@ -1,0 +1,1 @@
+``dials.tof_integrate``: add ``method=profile_3d_profilelib``, ``profile_3d_ibix``'s iBIX x bivariate Gaussian model with the shape measured on strong reflections and held fixed elsewhere, as ``profile_1d_profilelib`` does for the ToF line shape. Weak reflections are fitted at their predicted position, strong ones with the position free.
