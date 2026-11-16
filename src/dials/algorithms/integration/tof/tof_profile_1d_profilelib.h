@@ -30,6 +30,7 @@ namespace dials { namespace algorithms {
     double alpha = 0.0;
     double beta = 0.0;
     double sigma = 0.0;
+    double T_ph = 0.0;  // fitted peak position (us) on the reflection it came from
     bool valid = false;
   };
 
@@ -812,6 +813,7 @@ namespace dials { namespace algorithms {
         shape_out->alpha = profile.alpha;
         shape_out->beta = profile.beta;
         shape_out->sigma = profile.sigma;
+        shape_out->T_ph = profile.T_ph;
         shape_out->valid = true;
       }
       double I_prf = profile.calc_intensity();
