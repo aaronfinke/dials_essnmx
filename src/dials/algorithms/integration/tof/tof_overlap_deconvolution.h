@@ -9,7 +9,6 @@
 #include <eigen3/Eigen/Dense>
 #include <dials/algorithms/integration/tof/tof_integration.h>
 #include <dials/algorithms/integration/tof/tof_overlaps.h>
-#include <dials/algorithms/integration/tof/tof_profile_3d_bvg.h>
 #include <dials/util/thread_pool.h>
 
 /*
@@ -25,13 +24,12 @@
  * with P_ik the unit-intensity profile of reflection k at voxel i, and the
  * intensities a_k follow from one weighted least-squares solve. The shapes are
  * not fitted here. They come from the profile library measured on strong,
- * unoverlapped reflections nearby: either the ToF line shape
- * profile_1d_profilelib uses, times a bivariate Gaussian measured on the
- * detector face, or profile_3d_profilelib's shape, fitted in 3D. Nor are the
- * positions fitted: each peak is placed at its prediction, and its profile
- * broadened by the scatter of observed about predicted positions that the
- * library measured (see local_peak_model in Profile1DProfilelibFitter and
- * Profile3DProfilelibFitter).
+ * unoverlapped reflections nearby (ProfileFitter::local_peak_model), as a
+ * PeakShape (tof_peak_shape.h): whatever model the method fits, this only
+ * needs it evaluated over a box. Nor are the positions fitted: each peak is
+ * placed at its prediction, and its profile broadened by the scatter of
+ * observed about predicted positions that the library measured
+ * (tof_profile_library.h).
  *
  *     a = (P^T W P)^-1 P^T W d,  cov(a) = (P^T W P)^-1
  *
@@ -161,13 +159,9 @@ namespace dials { namespace algorithms {
   struct OverlapClusterComponent {
     std::size_t index = 0;  // row of the reflection table
     scitbx::af::int6 bbox;
-    vec3<double> centroid;            // predicted, for voxel ownership
-    std::vector<double> tof_profile;  // along the bounding box, in ToF
-    // Across it, (x, y) with y fastest; one per ToF slice, z slowest, where
-    // the peak moves across the detector with ToF (drifts)
-    std::vector<double> xy_profile;
-    bool drifts = false;
-    double norm = 0.0;  // sum of the profile over the bounding box
+    vec3<double> centroid;  // predicted, for voxel ownership
+    // Unit-intensity profile over the bounding box, index (x * ny + y) * nz + z
+    std::vector<double> values;
 
     bool contains(int i, int j, int k) const {
       return i >= bbox[0] && i < bbox[1] && j >= bbox[2] && j < bbox[3] && k >= bbox[4]
@@ -177,24 +171,16 @@ namespace dials { namespace algorithms {
     // Unit-intensity profile at detector voxel (i, j, k), which must be inside
     // the bounding box
     double profile(int i, int j, int k) const {
-      std::size_t nx = bbox[1] - bbox[0];
       std::size_t ny = bbox[3] - bbox[2];
-      std::size_t z = k - bbox[4];
-      std::size_t xy = (i - bbox[0]) * ny + (j - bbox[2]);
-      if (drifts) {
-        xy += z * nx * ny;
-      }
-      return tof_profile[z] * xy_profile[xy] / norm;
+      std::size_t nz = bbox[5] - bbox[4];
+      return values[((i - bbox[0]) * ny + (j - bbox[2])) * nz + (k - bbox[4])];
     }
   };
 
   /*
-   * The profile of a reflection over its bounding box: the library's ToF line
-   * shape times its bivariate Gaussian on the detector face, placed at the
-   * predicted position corrected by the offset the library expects there. The
-   * centre of the Gaussian moves with ToF where the library says the peak
-   * drifts (profile_3d_profilelib); it is where expected at the centroid of
-   * the line shape.
+   * The profile of a reflection over its bounding box: the shape the library
+   * expects there, placed at the predicted position corrected by the offset
+   * the library expects there.
    *
    * Normalised to unit sum over the bounding box, which makes the fitted
    * intensity the intensity inside the box: the same quantity summation
@@ -206,10 +192,10 @@ namespace dials { namespace algorithms {
                                              const scitbx::af::int6& bbox,
                                              const vec3<double>& xyzcal_px,
                                              double tof_cal,
-                                             const LocalPeakModel& entry,
+                                             const LocalPeakModel& model,
                                              const scitbx::af::shared<double>& img_tof,
                                              OverlapClusterComponent& component) {
-    if (!entry.shape.valid) {
+    if (!model.shape) {
       return false;
     }
     if (bbox[1] <= bbox[0] || bbox[3] <= bbox[2] || bbox[5] <= bbox[4] || bbox[4] < 0
@@ -223,53 +209,16 @@ namespace dials { namespace algorithms {
     const std::size_t nx = bbox[1] - bbox[0];
     const std::size_t ny = bbox[3] - bbox[2];
     const std::size_t nz = bbox[5] - bbox[4];
-
-    scitbx::af::shared<double> tof(nz);
+    std::vector<double> tof(nz);
     for (std::size_t z = 0; z < nz; ++z) {
       tof[z] = img_tof[bbox[4] + z];
     }
-    const double t_ph = tof_cal + entry.dt - ibix_centroid_offset(entry.shape);
-    scitbx::af::shared<double> line = profile1d_func(tof.const_ref(),
-                                                     1.0,
-                                                     entry.shape.alpha,
-                                                     entry.shape.beta,
-                                                     entry.shape.sigma,
-                                                     t_ph);
-    component.tof_profile.assign(nz, 0.0);
-    for (std::size_t z = 0; z < nz; ++z) {
-      double v = line[z];
-      if (!std::isfinite(v) || v < 0.0) {
-        v = 0.0;
-      }
-      component.tof_profile[z] = v;
-    }
-    component.drifts = entry.drift_x != 0.0 || entry.drift_y != 0.0;
-    const double t_centroid = tof_cal + entry.dt;
-    const std::size_t n_faces = component.drifts ? nz : 1;
-    component.xy_profile.assign(n_faces * nx * ny, 0.0);
-    std::vector<double> face_sum(n_faces, 0.0);
-    for (std::size_t f = 0; f < n_faces; ++f) {
-      double dt = component.drifts ? tof[f] - t_centroid : 0.0;
-      double x_peak = xyzcal_px[0] + entry.dx + entry.drift_x * dt;
-      double y_peak = xyzcal_px[1] + entry.dy + entry.drift_y * dt;
-      for (std::size_t ix = 0; ix < nx; ++ix) {
-        for (std::size_t iy = 0; iy < ny; ++iy) {
-          double v = bvg_func(bbox[0] + ix + 0.5 - x_peak,
-                              bbox[2] + iy + 0.5 - y_peak,
-                              entry.sig_x,
-                              entry.sig_y,
-                              entry.sig_p);
-          component.xy_profile[f * nx * ny + ix * ny + iy] = v;
-          face_sum[f] += v;
-        }
-      }
-    }
-
-    component.norm = 0.0;
-    for (std::size_t z = 0; z < nz; ++z) {
-      component.norm += component.tof_profile[z] * face_sum[component.drifts ? z : 0];
-    }
-    return component.norm > 0.0 && std::isfinite(component.norm);
+    PeakPosition centre;
+    centre.x = xyzcal_px[0] + model.offset.x;
+    centre.y = xyzcal_px[1] + model.offset.y;
+    centre.t = tof_cal + model.offset.t;
+    return model.shape->box_profile(
+      bbox[0], bbox[2], nx, ny, tof, centre, component.values);
   }
 
   /*

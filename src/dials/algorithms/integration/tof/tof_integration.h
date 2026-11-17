@@ -24,6 +24,8 @@
 #include <dials/algorithms/integration/tof/tof_profile_3d_ic.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_ibix.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_profilelib.h>
+#include <dials/algorithms/integration/tof/tof_peak_shape.h>
+#include <dials/algorithms/integration/tof/tof_profile_library.h>
 #include <dials/algorithms/scaling/tof/tof_scaling.h>
 #include <dials/util/thread_pool.h>
 #include <atomic>
@@ -531,33 +533,6 @@ namespace dials { namespace algorithms {
     return result;
   }
 
-  /*
-   * One entry of a profile library: a peak shape and where on the detector it
-   * was measured.  Shapes vary across the detector, so a weak reflection takes
-   * the shape of the nearest strong one, as Mantid keys its library on
-   * (phi, theta).
-   */
-  struct ProfileLibraryEntry {
-    int panel = 0;
-    double x = 0.0;
-    double y = 0.0;
-    IBIXShape shape;
-
-    /*
-     * The shape of the peak on the detector face, as a bivariate Gaussian, and
-     * how far the peak sat from where it was predicted. Only needed to model a
-     * reflection in 3D (see tof_overlap_deconvolution.h), and only set, with
-     * has_xy, where the measurement converged.
-     */
-    bool has_xy = false;
-    double sig_x = 0.0;
-    double sig_y = 0.0;
-    double sig_p = 0.0;
-    double dx = 0.0;  // observed minus predicted position (px)
-    double dy = 0.0;
-    double dt = 0.0;  // centroid of the fitted line shape minus predicted ToF (us)
-  };
-
   // Where a reflection is predicted to be, and where its shoebox starts
   struct ReflectionGeometry {
     double x_cal = 0.0;  // px
@@ -617,35 +592,30 @@ namespace dials { namespace algorithms {
   }
 
   /*
-   * The centroid of the ToF line shape relative to its T_ph parameter. The
-   * shape is a rising exponential (rate alpha) joined to a falling one (rate
-   * beta), convolved with a Gaussian, whose mean is 1/beta - 1/alpha. T_ph is
-   * therefore not where the peak is, and how far off it is depends on the
-   * shape, so the position of a peak is carried as its centroid: that can be
-   * compared between reflections of different shape.
-   */
-  inline double ibix_centroid_offset(const IBIXShape& shape) {
-    return 1.0 / shape.beta - 1.0 / shape.alpha;
-  }
-
-  /*
    * What is expected of a reflection that cannot be measured on its own: its
-   * shape in ToF and on the detector face, and where its peak sits relative
-   * to its prediction. See Profile1DProfilelibFitter::local_peak_model.
+   * shape, already broadened by how uncertain its position is, and where its
+   * peak sits relative to its prediction. See local_peak_model in the
+   * fitters that build a profile library.
    */
   struct LocalPeakModel {
-    IBIXShape shape;
-    double sig_x = 0.0;
-    double sig_y = 0.0;
-    double sig_p = 0.0;
-    double dx = 0.0;  // expected peak minus predicted position (px)
-    double dy = 0.0;
-    double dt = 0.0;  // expected centroid minus predicted ToF (us)
-    // Movement of the centre across the detector with ToF (px/us), about its
-    // position at the centroid
-    double drift_x = 0.0;
-    double drift_y = 0.0;
+    std::shared_ptr<const PeakShape> shape;
+    PeakPosition offset;  // expected peak minus predicted position (px, px, us)
   };
+
+  // profile_3d_profilelib's shape as a PeakShape
+  inline IBIXGaussianShape ibix_gaussian_shape(const Profile3DShape& s) {
+    IBIXGaussianShape shape;
+    shape.line.alpha = s.alpha;
+    shape.line.beta = s.beta;
+    shape.line.sigma = s.sigma;
+    shape.line.valid = s.valid;
+    shape.sig_x = s.sig_x;
+    shape.sig_y = s.sig_y;
+    shape.sig_p = s.sig_p;
+    shape.drift_x = s.drift_x;
+    shape.drift_y = s.drift_y;
+    return shape;
+  }
 
   /*
    * The shape of a peak on the detector face, as a bivariate Gaussian.
@@ -902,16 +872,6 @@ namespace dials { namespace algorithms {
                          double y,
                          const ReflectionGeometry* geometry = nullptr) {}
 
-    // The library entry measured nearest to (x, y), on the same panel where
-    // there is one. With require_xy, only entries that also hold the shape on
-    // the detector face are considered.
-    virtual const ProfileLibraryEntry* nearest_entry(int panel,
-                                                     double x,
-                                                     double y,
-                                                     bool require_xy = false) const {
-      return nullptr;
-    }
-
     // Pass two: fit with the shape taken from the library
     virtual bool fit_with_library(const ShoeboxIntegrationResult& shoebox_result,
                                   int panel,
@@ -981,6 +941,16 @@ namespace dials { namespace algorithms {
    */
   class Profile1DProfilelibFitter : public ProfileFitter {
   public:
+    // A library entry: the line shape in ToF, and where the detector face
+    // could be measured too (has_offset), its shape there
+    struct Shape {
+      IBIXShape line;
+      double sig_x = 0.0;
+      double sig_y = 0.0;
+      double sig_p = 0.0;
+    };
+    using Library = ProfileLibrary<Shape>;
+
     explicit Profile1DProfilelibFitter(TOFProfile1DProfilelibParams params)
         : params_(params),
           min_i_sigma_(params.library_min_i_sigma),
@@ -1022,11 +992,11 @@ namespace dials { namespace algorithms {
         return;
       }
 
-      ProfileLibraryEntry entry;
+      Library::Entry entry;
       entry.panel = panel;
       entry.x = x;
       entry.y = y;
-      entry.shape = shape;
+      entry.shape.line = shape;
 
       if (geometry != nullptr) {
         double cx = 0.0, cy = 0.0;
@@ -1036,18 +1006,16 @@ namespace dials { namespace algorithms {
                              geometry->y0,
                              cx,
                              cy,
-                             entry.sig_x,
-                             entry.sig_y,
-                             entry.sig_p)) {
-          entry.has_xy = true;
-          entry.dx = cx - geometry->x_cal;
-          entry.dy = cy - geometry->y_cal;
-          entry.dt = shape.T_ph + ibix_centroid_offset(shape) - geometry->tof_cal;
+                             entry.shape.sig_x,
+                             entry.shape.sig_y,
+                             entry.shape.sig_p)) {
+          entry.has_offset = true;
+          entry.offset.x = cx - geometry->x_cal;
+          entry.offset.y = cy - geometry->y_cal;
+          entry.offset.t = shape.T_ph + ibix_centroid_offset(shape) - geometry->tof_cal;
         }
       }
-
-      std::lock_guard<std::mutex> lock(mutex_);
-      library_.push_back(entry);
+      library_.add(entry);
     }
 
     // Pass two: take the shape of the nearest library entry, on the same panel
@@ -1060,7 +1028,7 @@ namespace dials { namespace algorithms {
                           double& var_prf,
                           const ReflectionGeometry* geometry = nullptr) override {
       var_prf = shoebox_result.variance;
-      const ProfileLibraryEntry* entry = nearest_entry(panel, x, y);
+      const Library::Entry* entry = library_.nearest(panel, x, y);
       if (entry == nullptr) {
         return false;
       }
@@ -1069,7 +1037,7 @@ namespace dials { namespace algorithms {
       bool ok =
         fit_profile_1d_profilelib_forced(shoebox_result.projected_intensity.const_ref(),
                                          shoebox_result.tof_z.const_ref(),
-                                         entry->shape,
+                                         entry->shape.line,
                                          params_.A_min,
                                          params_.A_max,
                                          I_prf,
@@ -1102,63 +1070,25 @@ namespace dials { namespace algorithms {
     }
 
     std::size_t library_size_xy() const override {
-      std::size_t n = 0;
-      for (const auto& e : library_) {
-        if (e.has_xy) {
-          ++n;
-        }
-      }
-      return n;
+      return library_.size_with_offset();
     }
 
     /*
-     * Summarises the detector-face shapes and the position offsets of the
-     * library, per panel where a panel holds enough entries and over the whole
-     * detector otherwise, and measures how far individual reflections scatter
-     * about those offsets.
-     *
-     * The offset of one library reflection from its prediction is mostly that
-     * reflection's own prediction error, not something its neighbours share:
-     * on MANDI the scatter between reflections is 0.7 px and 0.7 ToF frames
-     * while panel medians differ by 0.1 to 0.2. So what a neighbour can be told
-     * is the typical offset and how uncertain its own position is, and both
-     * are taken from robust statistics rather than from any single entry.
+     * The library's offsets and their scatter (see ProfileLibrary), and the
+     * detector-face shape as their median over the same entries: the face is
+     * measured here only roughly, on the ToF-collapsed shoebox, and a median
+     * over many reflections is steadier than any one of them.
      */
     void finalise_library() override {
-      std::lock_guard<std::mutex> lock(mutex_);
-      panel_statistics_.clear();
-      have_statistics_ = false;
-
-      std::map<int, std::vector<const ProfileLibraryEntry*>> by_panel;
-      std::vector<const ProfileLibraryEntry*> all;
-      for (const auto& e : library_) {
-        if (e.has_xy) {
-          by_panel[e.panel].push_back(&e);
-          all.push_back(&e);
-        }
-      }
-      if (all.empty()) {
+      library_.finalise();
+      face_by_panel_.clear();
+      if (!library_.finalised()) {
         return;
       }
-      global_statistics_ = summarise(all);
-      for (const auto& item : by_panel) {
-        if (item.second.size() >= min_entries_per_panel_) {
-          panel_statistics_[item.first] = summarise(item.second);
-        }
+      global_face_ = median_face(library_.with_offset());
+      for (int panel : library_.panels_with_group()) {
+        face_by_panel_[panel] = median_face(library_.group(panel));
       }
-
-      // Scatter of each entry about the offset its panel would predict for it
-      std::vector<double> rx, ry, rt;
-      for (const ProfileLibraryEntry* e : all) {
-        const LibraryStatistics& stats = statistics_for(e->panel);
-        rx.push_back(e->dx - stats.dx);
-        ry.push_back(e->dy - stats.dy);
-        rt.push_back(e->dt - stats.dt);
-      }
-      scatter_x_ = robust_sd(rx);
-      scatter_y_ = robust_sd(ry);
-      scatter_t_ = robust_sd(rt);
-      have_statistics_ = true;
     }
 
     /*
@@ -1179,126 +1109,57 @@ namespace dials { namespace algorithms {
                           double x,
                           double y,
                           LocalPeakModel& model) const override {
-      if (!have_statistics_) {
+      if (!library_.finalised()) {
         return false;
       }
-      const ProfileLibraryEntry* entry = nearest_entry(panel, x, y, true);
-      if (entry == nullptr || !entry->shape.valid) {
+      const Library::Entry* entry = library_.nearest(panel, x, y, true);
+      if (entry == nullptr || !entry->shape.line.valid) {
         return false;
       }
-      const LibraryStatistics& stats = statistics_for(panel);
-      model.shape = entry->shape;
-      model.shape.sigma =
-        std::sqrt(entry->shape.sigma * entry->shape.sigma + scatter_t_ * scatter_t_);
-      model.sig_x = std::sqrt(stats.sig_x * stats.sig_x + scatter_x_ * scatter_x_);
-      model.sig_y = std::sqrt(stats.sig_y * stats.sig_y + scatter_y_ * scatter_y_);
-      model.sig_p =
-        stats.sig_p * stats.sig_x * stats.sig_y / (model.sig_x * model.sig_y);
-      model.dx = stats.dx;
-      model.dy = stats.dy;
-      model.dt = stats.dt;
-      return std::isfinite(model.shape.sigma) && model.sig_x > 0.0 && model.sig_y > 0.0;
-    }
-
-    const ProfileLibraryEntry* nearest_entry(int panel,
-                                             double x,
-                                             double y,
-                                             bool require_xy = false) const override {
-      const ProfileLibraryEntry* best = nullptr;
-      double best_d2 = std::numeric_limits<double>::infinity();
-      // Prefer the same panel; fall back to any panel if it holds no shapes
-      for (int same_panel = 1; same_panel >= 0; --same_panel) {
-        for (const auto& e : library_) {
-          if (same_panel && e.panel != panel) {
-            continue;
-          }
-          if (require_xy && !e.has_xy) {
-            continue;
-          }
-          double dx = e.x - x;
-          double dy = e.y - y;
-          double d2 = dx * dx + dy * dy;
-          if (d2 < best_d2) {
-            best_d2 = d2;
-            best = &e;
-          }
-        }
-        if (best != nullptr) {
-          break;
-        }
+      const Shape& face = face_for(panel);
+      IBIXGaussianShape shape;
+      shape.line = entry->shape.line;
+      shape.sig_x = face.sig_x;
+      shape.sig_y = face.sig_y;
+      shape.sig_p = face.sig_p;
+      shape = shape.broadened_copy(library_.scatter());
+      if (!shape.usable()) {
+        return false;
       }
-      return best;
+      model.shape = std::make_shared<IBIXGaussianShape>(shape);
+      model.offset = library_.offset(panel);
+      return true;
     }
 
   private:
-    struct LibraryStatistics {
-      double sig_x = 0.0, sig_y = 0.0, sig_p = 0.0;
-      double dx = 0.0, dy = 0.0, dt = 0.0;
-    };
-
-    static double median(std::vector<double> values) {
-      DIALS_ASSERT(!values.empty());
-      std::size_t mid = values.size() / 2;
-      std::nth_element(values.begin(), values.begin() + mid, values.end());
-      double upper = values[mid];
-      if (values.size() % 2 == 1) {
-        return upper;
+    static Shape median_face(const std::vector<const Library::Entry*>& entries) {
+      namespace detail = profile_library_detail;
+      std::vector<double> sig_x, sig_y, sig_p;
+      for (const Library::Entry* e : entries) {
+        sig_x.push_back(e->shape.sig_x);
+        sig_y.push_back(e->shape.sig_y);
+        sig_p.push_back(e->shape.sig_p);
       }
-      double lower = *std::max_element(values.begin(), values.begin() + mid);
-      return 0.5 * (lower + upper);
+      Shape face;
+      face.sig_x = detail::median(sig_x);
+      face.sig_y = detail::median(sig_y);
+      face.sig_p = detail::median(sig_p);
+      return face;
     }
 
-    // 1.4826 times the median absolute deviation from the median
-    static double robust_sd(const std::vector<double>& values) {
-      double centre = median(values);
-      std::vector<double> deviations(values.size());
-      for (std::size_t i = 0; i < values.size(); ++i) {
-        deviations[i] = std::abs(values[i] - centre);
-      }
-      return 1.4826 * median(deviations);
-    }
-
-    static LibraryStatistics summarise(
-      const std::vector<const ProfileLibraryEntry*>& entries) {
-      std::vector<double> sig_x, sig_y, sig_p, dx, dy, dt;
-      for (const ProfileLibraryEntry* e : entries) {
-        sig_x.push_back(e->sig_x);
-        sig_y.push_back(e->sig_y);
-        sig_p.push_back(e->sig_p);
-        dx.push_back(e->dx);
-        dy.push_back(e->dy);
-        dt.push_back(e->dt);
-      }
-      LibraryStatistics stats;
-      stats.sig_x = median(sig_x);
-      stats.sig_y = median(sig_y);
-      stats.sig_p = median(sig_p);
-      stats.dx = median(dx);
-      stats.dy = median(dy);
-      stats.dt = median(dt);
-      return stats;
-    }
-
-    const LibraryStatistics& statistics_for(int panel) const {
-      std::map<int, LibraryStatistics>::const_iterator it =
-        panel_statistics_.find(panel);
-      return it != panel_statistics_.end() ? it->second : global_statistics_;
+    const Shape& face_for(int panel) const {
+      std::map<int, Shape>::const_iterator it = face_by_panel_.find(panel);
+      return it != face_by_panel_.end() ? it->second : global_face_;
     }
 
     TOFProfile1DProfilelibParams params_;
     double min_i_sigma_;
     double min_corr_;
-    std::vector<ProfileLibraryEntry> library_;
-    mutable std::mutex mutex_;
+    Library library_;
 
     // Set by finalise_library
-    const std::size_t min_entries_per_panel_ = 10;
-    bool have_statistics_ = false;
-    LibraryStatistics global_statistics_;
-    std::map<int, LibraryStatistics> panel_statistics_;
-    double scatter_x_ = 0.0;
-    double scatter_y_ = 0.0;
-    double scatter_t_ = 0.0;
+    Shape global_face_;
+    std::map<int, Shape> face_by_panel_;
   };
 
   /*
@@ -1329,16 +1190,7 @@ namespace dials { namespace algorithms {
    */
   class Profile3DProfilelibFitter : public ProfileFitter {
   public:
-    struct Entry {
-      int panel = 0;
-      double x = 0.0;  // where it was measured: the centre of its box (px)
-      double y = 0.0;
-      Profile3DShape shape;
-      bool has_offset = false;
-      double dx = 0.0;  // fitted minus predicted position (px, px, us)
-      double dy = 0.0;
-      double dt = 0.0;
-    };
+    using Library = ProfileLibrary<Profile3DShape>;
 
     explicit Profile3DProfilelibFitter(TOFProfile3DProfilelibParams params)
         : params_(params) {}
@@ -1365,57 +1217,28 @@ namespace dials { namespace algorithms {
         return;
       }
 
-      Entry entry;
+      Library::Entry entry;
       entry.panel = panel;
       entry.x = x;
       entry.y = y;
       entry.shape = fit.shape;
       if (geometry != nullptr) {
         entry.has_offset = true;
-        entry.dx = fit.position.x - geometry->x_cal;
-        entry.dy = fit.position.y - geometry->y_cal;
-        entry.dt = fit.position.t - geometry->tof_cal;
+        entry.offset.x = fit.position.x - geometry->x_cal;
+        entry.offset.y = fit.position.y - geometry->y_cal;
+        entry.offset.t = fit.position.t - geometry->tof_cal;
       }
-      std::lock_guard<std::mutex> lock(mutex_);
-      library_.push_back(entry);
+      library_.add(entry);
     }
 
     void finalise_library() override {
-      namespace detail = profile_3d_profilelib_detail;
-      std::lock_guard<std::mutex> lock(mutex_);
-      have_offsets_ = false;
-      panel_offsets_.clear();
-
-      std::map<int, std::vector<const Entry*>> by_panel;
-      std::vector<const Entry*> all;
-      for (const auto& e : library_) {
-        if (e.has_offset) {
-          by_panel[e.panel].push_back(&e);
-          all.push_back(&e);
-        }
-      }
-      if (all.empty()) {
+      library_.finalise();
+      if (!library_.finalised()) {
         return;
       }
-      global_offset_ = median_offset(all);
-      for (const auto& item : by_panel) {
-        if (item.second.size() >= min_entries_per_panel_) {
-          panel_offsets_[item.first] = median_offset(item.second);
-        }
-      }
-      std::vector<double> rx, ry, rt;
-      for (const Entry* e : all) {
-        const Profile3DPosition& o = offset_for(e->panel);
-        rx.push_back(e->dx - o.x);
-        ry.push_back(e->dy - o.y);
-        rt.push_back(e->dt - o.t);
-      }
-      scatter_.x = detail::robust_sd(rx);
-      scatter_.y = detail::robust_sd(ry);
-      scatter_.t = detail::robust_sd(rt);
-      have_offsets_ = true;
-      std::cout << "      library offsets from prediction scatter by " << scatter_.x
-                << " px, " << scatter_.y << " px, " << scatter_.t << " us" << std::endl;
+      const PeakPosition& scatter = library_.scatter();
+      std::cout << "      library offsets from prediction scatter by " << scatter.x
+                << " px, " << scatter.y << " px, " << scatter.t << " us" << std::endl;
     }
 
     bool fit_with_library(const ShoeboxIntegrationResult& shoebox_result,
@@ -1426,14 +1249,15 @@ namespace dials { namespace algorithms {
                           double& var_prf,
                           const ReflectionGeometry* geometry = nullptr) override {
       var_prf = shoebox_result.variance;
-      const Entry* entry = nearest(panel, x, y);
+      const Library::Entry* entry = library_.nearest(panel, x, y);
       if (entry == nullptr) {
         return false;
       }
       Profile3DData d = profile_3d_data(shoebox_result);
       Profile3DFitResult result;
-      if (geometry != nullptr && have_offsets_ && d.nz > 1) {
-        const Profile3DPosition& o = offset_for(panel);
+      if (geometry != nullptr && library_.finalised() && d.nz > 1) {
+        const PeakPosition& o = library_.offset(panel);
+        const PeakPosition& scatter = library_.scatter();
         Profile3DPosition seed;
         seed.x = geometry->x_cal + o.x;
         seed.y = geometry->y_cal + o.y;
@@ -1442,7 +1266,7 @@ namespace dials { namespace algorithms {
         // At the expected position, with the shape broadened by how
         // uncertain that position is
         result = fit_profile_3d_profilelib_fixed(
-          d, broaden_profile_3d_shape(entry->shape, scatter_), seed);
+          d, broaden_profile_3d_shape(entry->shape, scatter), seed);
 
         // Where that finds a peak strong enough to place, place it
         if (result.success && result.variance > 0.0
@@ -1450,9 +1274,9 @@ namespace dials { namespace algorithms {
                  >= params_.free_position_min_i_sigma) {
           double mean_dt = (d.t.back() - d.t.front()) / (d.nz - 1);
           Profile3DPosition tolerance;
-          tolerance.x = std::max(params_.position_tolerance * scatter_.x, 1.0);
-          tolerance.y = std::max(params_.position_tolerance * scatter_.y, 1.0);
-          tolerance.t = std::max(params_.position_tolerance * scatter_.t, mean_dt);
+          tolerance.x = std::max(params_.position_tolerance * scatter.x, 1.0);
+          tolerance.y = std::max(params_.position_tolerance * scatter.y, 1.0);
+          tolerance.t = std::max(params_.position_tolerance * scatter.t, mean_dt);
           Profile3DFitResult placed =
             fit_profile_3d_profilelib_forced(d, entry->shape, &seed, &tolerance);
           if (placed.success) {
@@ -1493,13 +1317,7 @@ namespace dials { namespace algorithms {
     // Every entry holds the shape on the detector face; these also hold their
     // offset from the prediction
     std::size_t library_size_xy() const override {
-      std::size_t n = 0;
-      for (const auto& e : library_) {
-        if (e.has_offset) {
-          ++n;
-        }
-      }
-      return n;
+      return library_.size_with_offset();
     }
 
     /*
@@ -1512,85 +1330,26 @@ namespace dials { namespace algorithms {
                           double x,
                           double y,
                           LocalPeakModel& model) const override {
-      if (!have_offsets_) {
+      if (!library_.finalised()) {
         return false;
       }
-      const Entry* entry = nearest(panel, x, y);
+      const Library::Entry* entry = library_.nearest(panel, x, y);
       if (entry == nullptr || !entry->shape.valid) {
         return false;
       }
-      Profile3DShape shape = broaden_profile_3d_shape(entry->shape, scatter_);
-      const Profile3DPosition& o = offset_for(panel);
-      model.shape.alpha = shape.alpha;
-      model.shape.beta = shape.beta;
-      model.shape.sigma = shape.sigma;
-      model.shape.valid = true;
-      model.sig_x = shape.sig_x;
-      model.sig_y = shape.sig_y;
-      model.sig_p = shape.sig_p;
-      model.drift_x = shape.drift_x;
-      model.drift_y = shape.drift_y;
-      model.dx = o.x;
-      model.dy = o.y;
-      model.dt = o.t;
-      return std::isfinite(model.shape.sigma) && model.sig_x > 0.0 && model.sig_y > 0.0;
+      IBIXGaussianShape shape =
+        ibix_gaussian_shape(entry->shape).broadened_copy(library_.scatter());
+      if (!shape.usable()) {
+        return false;
+      }
+      model.shape = std::make_shared<IBIXGaussianShape>(shape);
+      model.offset = library_.offset(panel);
+      return true;
     }
 
   private:
-    const Entry* nearest(int panel, double x, double y) const {
-      const Entry* best = nullptr;
-      double best_d2 = std::numeric_limits<double>::infinity();
-      // Prefer the same panel; fall back to any panel if it holds no shapes
-      for (int same_panel = 1; same_panel >= 0; --same_panel) {
-        for (const auto& e : library_) {
-          if (same_panel && e.panel != panel) {
-            continue;
-          }
-          double dx = e.x - x;
-          double dy = e.y - y;
-          double d2 = dx * dx + dy * dy;
-          if (d2 < best_d2) {
-            best_d2 = d2;
-            best = &e;
-          }
-        }
-        if (best != nullptr) {
-          break;
-        }
-      }
-      return best;
-    }
-
-    static Profile3DPosition median_offset(const std::vector<const Entry*>& entries) {
-      namespace detail = profile_3d_profilelib_detail;
-      std::vector<double> dx, dy, dt;
-      for (const Entry* e : entries) {
-        dx.push_back(e->dx);
-        dy.push_back(e->dy);
-        dt.push_back(e->dt);
-      }
-      Profile3DPosition o;
-      o.x = detail::median(dx);
-      o.y = detail::median(dy);
-      o.t = detail::median(dt);
-      return o;
-    }
-
-    const Profile3DPosition& offset_for(int panel) const {
-      std::map<int, Profile3DPosition>::const_iterator it = panel_offsets_.find(panel);
-      return it != panel_offsets_.end() ? it->second : global_offset_;
-    }
-
     TOFProfile3DProfilelibParams params_;
-    std::vector<Entry> library_;
-    mutable std::mutex mutex_;
-
-    // Set by finalise_library
-    const std::size_t min_entries_per_panel_ = 10;
-    bool have_offsets_ = false;
-    Profile3DPosition global_offset_;
-    std::map<int, Profile3DPosition> panel_offsets_;
-    Profile3DPosition scatter_;
+    Library library_;
   };
 
   class Profile1DICFitter : public ProfileFitter {
