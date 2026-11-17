@@ -8,6 +8,7 @@
 #include <vector>
 #include <eigen3/Eigen/Dense>
 #include <eigen3/unsupported/Eigen/NonLinearOptimization>
+#include <dials/algorithms/integration/tof/tof_peak_shape.h>
 #include <dials/algorithms/integration/tof/tof_profile_1d_profilelib.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_bvg.h>
 
@@ -134,11 +135,7 @@ namespace dials { namespace algorithms {
 
   // Where a peak is: its centre on the detector (px) at the centroid of its
   // line shape (us)
-  struct Profile3DPosition {
-    double x = 0.0;
-    double y = 0.0;
-    double t = 0.0;
-  };
+  using Profile3DPosition = PeakPosition;
 
   /*
    * The voxels of one bounding box, as a profile fit needs them. Indexed
@@ -444,30 +441,6 @@ namespace dials { namespace algorithms {
         return 0;
       }
     };
-
-    inline double median(std::vector<double> values) {
-      if (values.empty()) {
-        return 0.0;
-      }
-      std::size_t mid = values.size() / 2;
-      std::nth_element(values.begin(), values.begin() + mid, values.end());
-      double upper = values[mid];
-      if (values.size() % 2 == 1) {
-        return upper;
-      }
-      double lower = *std::max_element(values.begin(), values.begin() + mid);
-      return 0.5 * (lower + upper);
-    }
-
-    // 1.4826 times the median absolute deviation from the median
-    inline double robust_sd(const std::vector<double>& values) {
-      double centre = median(values);
-      std::vector<double> deviations(values.size());
-      for (std::size_t i = 0; i < values.size(); ++i) {
-        deviations[i] = std::abs(values[i] - centre);
-      }
-      return 1.4826 * median(deviations);
-    }
 
     inline bool summarise(const Profile3DData& d,
                           const std::vector<double>& variance,
