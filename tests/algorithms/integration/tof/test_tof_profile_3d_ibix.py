@@ -5,9 +5,9 @@ import pytest
 
 from dials.array_family import flex
 from dials_algorithms_tof_integration_ext import (
-    TOFProfile3DProfilelibParams,
-    fit_profile_3d_profilelib,
-    profile_3d_profilelib_profile,
+    TOFProfile3DIBIXParams,
+    fit_profile_3d_ibix,
+    profile_3d_ibix_profile,
 )
 
 # A box of 13 x 13 pixels and 40 ToF bins of 20 us
@@ -22,7 +22,7 @@ BACKGROUND = 2.0  # counts per voxel
 
 
 def make_params():
-    return TOFProfile3DProfilelibParams(
+    return TOFProfile3DIBIXParams(
         {
             "alpha": 0.03,
             "alpha_min": 1e-5,
@@ -48,7 +48,7 @@ def make_params():
 
 
 def profile(shape=SHAPE, position=POSITION):
-    return np.array(profile_3d_profilelib_profile(NX, NY, X0, Y0, TOF, shape, position))
+    return np.array(profile_3d_ibix_profile(NX, NY, X0, Y0, TOF, shape, position))
 
 
 def fit(counts, **options):
@@ -56,7 +56,7 @@ def fit(counts, **options):
     dials.tof_integrate corrects them without an incident spectrum."""
     n = NX * NY * NZ
     value = (counts - BACKGROUND) / BIN_WIDTH
-    return fit_profile_3d_profilelib(
+    return fit_profile_3d_ibix(
         NX,
         NY,
         X0,

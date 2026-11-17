@@ -31,11 +31,11 @@ from dials.util.options import ArgumentParser, reflections_and_experiments_from_
 from dials.util.phil import parse
 from dials.util.version import dials_version
 from dials_algorithms_tof_integration_ext import (
+    TOFProfile1DIBIXParams,
     TOFProfile1DICParams,
-    TOFProfile1DProfilelibParams,
     TOFProfile3DGutmannParams,
+    TOFProfile3DIBIXParams,
     TOFProfile3DICParams,
-    TOFProfile3DProfilelibParams,
     integrate_reflection_table,
     tof_assign_overlap_ownership,
     tof_calculate_ellipse_shoebox_mask,
@@ -855,7 +855,7 @@ def make_profile_1d_ibix_params(
             f"{p.library.min_correlation}, then holding them fixed elsewhere"
         )
     # dict needed due to boost limit of 15 template arguments
-    return TOFProfile1DProfilelibParams(
+    return TOFProfile1DIBIXParams(
         {
             "A_min": p.min_A,
             "A_max": p.max_A,
@@ -922,7 +922,7 @@ def make_profile_3d_ibix_params(
             f"{p.library.min_correlation}, then holding them fixed elsewhere"
         )
     # dict needed due to boost limit of 15 template arguments
-    return TOFProfile3DProfilelibParams(
+    return TOFProfile3DIBIXParams(
         {
             "alpha": p.init_alpha,
             "alpha_min": p.min_alpha,
@@ -964,18 +964,16 @@ def integrate_reflection_table_for_experiment(
     """
     apply_lorentz = params.corrections.lorentz
     profile_1d_ibix_params = None
-    profile_1d_profilelib_params = None
     profile_1d_ic_params = None
     profile_3d_gutmann_params = None
     profile_3d_ic_params = None
     profile_3d_ibix_params = None
-    profile_3d_profilelib_params = None
 
     logger.info(f"    Integrating using {params.method}")
 
     show_profile_failures = logger.getEffectiveLevel() == logging.DEBUG
     if params.method in ("profile_1d_ibix", "profile_1d_profilelib"):
-        profile_1d_profilelib_params = make_profile_1d_ibix_params(
+        profile_1d_ibix_params = make_profile_1d_ibix_params(
             params, show_profile_failures
         )
     elif params.method == "profile_1d_ic":
@@ -1052,7 +1050,7 @@ def integrate_reflection_table_for_experiment(
             }
         )
     elif params.method in ("profile_3d_ibix", "profile_3d_profilelib"):
-        profile_3d_profilelib_params = make_profile_3d_ibix_params(
+        profile_3d_ibix_params = make_profile_3d_ibix_params(
             params, show_profile_failures
         )
 
@@ -1078,9 +1076,7 @@ def integrate_reflection_table_for_experiment(
         profile_3d_gutmann_params,
         profile_3d_ic_params,
         profile_3d_ibix_params,
-        profile_1d_profilelib_params,
         params.corrections.lorentz_wavelength_power,
-        profile_3d_profilelib_params=profile_3d_profilelib_params,
     )
 
     return expt_reflections, profile_fitter
