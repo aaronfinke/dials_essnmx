@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <vector>
 #include <eigen3/Eigen/Dense>
@@ -74,6 +75,19 @@ namespace dials { namespace algorithms {
     double library_min_corr;     // correlation over the peak its shape fit must reach
     double position_tolerance;   // forced fit: scatters of library offsets allowed
     double free_position_min_i_sigma;  // I/sigma above which the position is fitted
+    // Correlation over the peak a free fit must reach to be accepted, where a
+    // reflection is fitted on its own rather than with a library shape
+    double min_corr = 0.5;
+    // Further tests of a reflection fitted on its own (0 disables each):
+    // correlation over every usable voxel of the box, and how far the model's
+    // peak height may be from the data's tallest voxel, as a fraction of it.
+    // A position fitted freely to a weak peak finds a blob of noise that
+    // matches the model over its own peak; over the whole box it does not.
+    double free_fit_box_min_corr = 0.0;
+    double free_fit_peak_height_fraction = 0.0;
+    // Measure shapes on strong reflections and fit the rest with them (two
+    // passes); without, every reflection is fitted freely on its own
+    bool build_library = true;
 
     TOFProfile3DProfilelibParams(double alpha_,
                                  double alpha_min_,
@@ -725,11 +739,63 @@ namespace dials { namespace algorithms {
    * amplitude is positive, and neither width on the detector nor the
    * correlation between them has run to a bound.
    */
+  namespace profile_3d_profilelib_detail {
+
+    /*
+     * Model (intensity times profile) against data over every usable voxel of
+     * the box: their correlation, mean subtracted, and the model's peak
+     * height against the data's tallest voxel.
+     */
+    inline void box_agreement(const Profile3DData& d,
+                              const Profile3DFitResult& r,
+                              double& correlation,
+                              double& peak_height_error) {
+      double n = 0.0, sum_d = 0.0, sum_m = 0.0, peak_d = 0.0, peak_m = 0.0;
+      for (std::size_t i = 0; i < d.size(); ++i) {
+        if (!d.usable(i)) {
+          continue;
+        }
+        double m = r.intensity * r.profile[i];
+        n += 1.0;
+        sum_d += d.value[i];
+        sum_m += m;
+        peak_d = std::max(peak_d, d.value[i]);
+        peak_m = std::max(peak_m, m);
+      }
+      correlation = 0.0;
+      peak_height_error = std::numeric_limits<double>::infinity();
+      if (n < 2.0) {
+        return;
+      }
+      double mean_d = sum_d / n, mean_m = sum_m / n;
+      double num = 0.0, var_d = 0.0, var_m = 0.0;
+      for (std::size_t i = 0; i < d.size(); ++i) {
+        if (!d.usable(i)) {
+          continue;
+        }
+        double a = d.value[i] - mean_d;
+        double b = r.intensity * r.profile[i] - mean_m;
+        num += a * b;
+        var_d += a * a;
+        var_m += b * b;
+      }
+      if (var_d > 0.0 && var_m > 0.0) {
+        correlation = num / std::sqrt(var_d * var_m);
+      }
+      if (peak_d > 0.0) {
+        peak_height_error = std::abs(peak_m - peak_d) / peak_d;
+      }
+    }
+
+  }  // namespace profile_3d_profilelib_detail
+
   inline Profile3DFitResult fit_profile_3d_profilelib_shape(
     const Profile3DData& d,
     const TOFProfile3DProfilelibParams& params,
     double min_correlation,
-    int n_reweight = 2) {
+    int n_reweight = 2,
+    double box_min_correlation = 0.0,
+    double peak_height_fraction = 0.0) {
     namespace detail = profile_3d_profilelib_detail;
     Profile3DFitResult best;
     if (!d.consistent() || d.nx < 3 || d.ny < 3 || d.nz < 5) {
@@ -755,6 +821,19 @@ namespace dials { namespace algorithms {
       if (!(r.correlation >= min_correlation)) {
         why = "low correlation";
         return false;
+      }
+      if (box_min_correlation > 0.0 || peak_height_fraction > 0.0) {
+        double box_correlation = 0.0, peak_height_error = 0.0;
+        detail::box_agreement(d, r, box_correlation, peak_height_error);
+        if (box_min_correlation > 0.0 && !(box_correlation >= box_min_correlation)) {
+          why = "low correlation over the box";
+          return false;
+        }
+        if (peak_height_fraction > 0.0
+            && !(peak_height_error <= peak_height_fraction)) {
+          why = "peak height does not match the data";
+          return false;
+        }
       }
       if (detail::at_bound(r.shape.sig_x, lo[3], hi[3])
           || detail::at_bound(r.shape.sig_y, lo[4], hi[4])

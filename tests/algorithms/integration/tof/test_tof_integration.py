@@ -84,6 +84,20 @@ def test_tof_integration(dials_data, tmp_path):
             shutil.which("dials.tof_integrate"),
             expt_path,
             refl_path,
+            "method=profile_1d_ibix",
+            "profile_1d_ibix.library.build=True",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+    )
+    assert not result.returncode and not result.stderr
+
+    # The deprecated name for it still runs
+    result = subprocess.run(
+        [
+            shutil.which("dials.tof_integrate"),
+            expt_path,
+            refl_path,
             "method=profile_1d_profilelib",
         ],
         cwd=tmp_path,
@@ -136,7 +150,8 @@ def test_tof_integration(dials_data, tmp_path):
             shutil.which("dials.tof_integrate"),
             expt_path,
             refl_path,
-            "method=profile_3d_profilelib",
+            "method=profile_3d_ibix",
+            "profile_3d_ibix.library.build=True",
         ],
         cwd=tmp_path,
         capture_output=True,

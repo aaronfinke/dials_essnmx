@@ -77,24 +77,28 @@ namespace dials { namespace algorithms { namespace boost_python {
     auto d = [&](const char* key) { return extract<double>(params[key])(); };
     auto i = [&](const char* key) { return extract<int>(params[key])(); };
     auto b = [&](const char* key) { return extract<bool>(params[key])(); };
-    return std::make_shared<TOFProfile1DProfilelibParams>(
-      d("A_min"),
-      d("A_max"),
-      d("alpha"),
-      d("alpha_min"),
-      d("alpha_max"),
-      d("beta"),
-      d("beta_min"),
-      d("beta_max"),
-      i("n_restarts"),
-      b("optimize_profile"),
-      b("show_profile_failures"),
-      d("peak_height_smoothing"),
-      d("trust_min_corr"),
-      d("trust_peak_tolerance"),
-      d("trust_peak_height_fraction"),
-      d("library_min_i_sigma"),
-      d("library_min_corr"));
+    auto p =
+      std::make_shared<TOFProfile1DProfilelibParams>(d("A_min"),
+                                                     d("A_max"),
+                                                     d("alpha"),
+                                                     d("alpha_min"),
+                                                     d("alpha_max"),
+                                                     d("beta"),
+                                                     d("beta_min"),
+                                                     d("beta_max"),
+                                                     i("n_restarts"),
+                                                     b("optimize_profile"),
+                                                     b("show_profile_failures"),
+                                                     d("peak_height_smoothing"),
+                                                     d("trust_min_corr"),
+                                                     d("trust_peak_tolerance"),
+                                                     d("trust_peak_height_fraction"),
+                                                     d("library_min_i_sigma"),
+                                                     d("library_min_corr"));
+    if (params.has_key("build_library")) {
+      p->build_library = b("build_library");
+    }
+    return p;
   }
 
   std::shared_ptr<TOFProfile3DProfilelibParams> make_TOFProfile3DProfilelibParams(
@@ -102,26 +106,38 @@ namespace dials { namespace algorithms { namespace boost_python {
     auto d = [&](const char* key) { return extract<double>(params[key])(); };
     auto i = [&](const char* key) { return extract<int>(params[key])(); };
     auto b = [&](const char* key) { return extract<bool>(params[key])(); };
-    return std::make_shared<TOFProfile3DProfilelibParams>(
-      d("alpha"),
-      d("alpha_min"),
-      d("alpha_max"),
-      d("beta"),
-      d("beta_min"),
-      d("beta_max"),
-      d("SigX_min"),
-      d("SigX_max"),
-      d("SigY_min"),
-      d("SigY_max"),
-      d("SigP_min"),
-      d("SigP_max"),
-      d("max_drift_factor"),
-      i("n_restarts"),
-      b("show_profile_failures"),
-      d("library_min_i_sigma"),
-      d("library_min_corr"),
-      d("position_tolerance"),
-      d("free_position_min_i_sigma"));
+    auto p =
+      std::make_shared<TOFProfile3DProfilelibParams>(d("alpha"),
+                                                     d("alpha_min"),
+                                                     d("alpha_max"),
+                                                     d("beta"),
+                                                     d("beta_min"),
+                                                     d("beta_max"),
+                                                     d("SigX_min"),
+                                                     d("SigX_max"),
+                                                     d("SigY_min"),
+                                                     d("SigY_max"),
+                                                     d("SigP_min"),
+                                                     d("SigP_max"),
+                                                     d("max_drift_factor"),
+                                                     i("n_restarts"),
+                                                     b("show_profile_failures"),
+                                                     d("library_min_i_sigma"),
+                                                     d("library_min_corr"),
+                                                     d("position_tolerance"),
+                                                     d("free_position_min_i_sigma"));
+    // Without its own value a free fit is held to the library's threshold
+    p->min_corr = params.has_key("min_corr") ? d("min_corr") : p->library_min_corr;
+    if (params.has_key("free_fit_box_min_corr")) {
+      p->free_fit_box_min_corr = d("free_fit_box_min_corr");
+    }
+    if (params.has_key("free_fit_peak_height_fraction")) {
+      p->free_fit_peak_height_fraction = d("free_fit_peak_height_fraction");
+    }
+    if (params.has_key("build_library")) {
+      p->build_library = b("build_library");
+    }
+    return p;
   }
 
   std::shared_ptr<TOFProfile1DICParams> make_TOFProfile1DICParams(dict params) {
