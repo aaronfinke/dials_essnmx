@@ -60,6 +60,9 @@ namespace dials { namespace algorithms {
     double trust_peak_height_fraction;  // Allowed relative error on the peak height
     double library_min_i_sigma;  // Summation I/sigma a shape's reflection must reach
     double library_min_corr;     // Correlation its free fit must reach
+    // Measure shapes on strong reflections and fit the rest with them (two
+    // passes); without, every reflection is fitted freely on its own
+    bool build_library = true;
 
     TOFProfile1DProfilelibParams(double A_min,
                                  double A_max,

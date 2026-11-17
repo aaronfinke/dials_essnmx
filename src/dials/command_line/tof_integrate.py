@@ -31,11 +31,9 @@ from dials.util.options import ArgumentParser, reflections_and_experiments_from_
 from dials.util.phil import parse
 from dials.util.version import dials_version
 from dials_algorithms_tof_integration_ext import (
-    TOFProfile1DIBIXParams,
     TOFProfile1DICParams,
     TOFProfile1DProfilelibParams,
     TOFProfile3DGutmannParams,
-    TOFProfile3DIBIXParams,
     TOFProfile3DICParams,
     TOFProfile3DProfilelibParams,
     integrate_reflection_table,
@@ -89,9 +87,8 @@ method = *summation profile_1d_ibix profile_1d_profilelib profile_1d_ic profile_
     .help = "Integration method: "
             "summation: shoebox summation"
             "profile_1d_ibix: https://doi.org/10.1038/srep36628 "
-            "profile_1d_profilelib: profile_1d_ibix's model, with the shape taken "
-            "from a library measured on strong reflections, after Mantid's "
-            "IntegratePeaksProfileFitting "
+            "profile_1d_profilelib: deprecated, profile_1d_ibix with "
+            "library.build=True and MANDI parameters "
             "profile_1d_ic: Ikeda-Carpenter model, "
             "https://doi.org/10.1016/0168-9002(85)90033-6"
             "profile_3d_gutmann: https://doi.org/10.1016/j.nima.2016.12.026"
@@ -99,9 +96,8 @@ method = *summation profile_1d_ibix profile_1d_profilelib profile_1d_ic profile_
             "https://doi.org/10.1016/0168-9002(85)90033-6"
             "profile_3d_ibix: separable iBIX x bivariate Gaussian model, "
             "https://doi.org/10.1038/srep36628 "
-            "profile_3d_profilelib: profile_3d_ibix's model, with the shape"
-            "taken from a library measured on strong reflections, as"
-            "profile_1d_profilelib does for the ToF line shape alone"
+            "profile_3d_profilelib: deprecated, profile_3d_ibix with "
+            "library.build=True and MANDI parameters"
 
 mask = *ellipse seed_skewness
     .type = choice
@@ -167,25 +163,36 @@ corrections{
         }
     }
 }
-profile_1d_ibix{
+profile_1d_ibix
+    .help = "The iBIX line shape (back-to-back exponentials convolved with a"
+            "Gaussian) fitted to the ToF projection of each reflection. With"
+            "library.build, the shape is measured on strong reflections only,"
+            "and every reflection is fitted with the shape of the nearest of"
+            "those held fixed (after Mantid's IntegratePeaksProfileFitting)."
+            "The defaults suit a long-pulse source such as ISIS SXD. For a"
+            "short-pulse source such as MANDI use min_alpha=1e-5"
+            "max_alpha=10 min_beta=1e-5 max_beta=10 min_correlation=0.5"
+            "peak_tolerance=300 peak_height_smoothing=60 library.build=True:"
+            "MANDI peaks fit alpha near 0.005, below the default floor."
+{
     init_alpha = 0.03
         .type = float
-        .help = "Initial alpha value before optimization"
+        .help = "Initial alpha (1/us) before optimization"
     init_beta = 0.03
         .type = float
-        .help = "Initial beta value before optimization"
+        .help = "Initial beta (1/us) before optimization"
     min_alpha = 0.02
         .type = float
-        .help = "Min alpha value for optimization"
+        .help = "Min alpha (1/us)"
     max_alpha = 1.0
         .type = float
-        .help = "Max alpha value for optimization"
+        .help = "Max alpha (1/us)"
     min_beta = 0.0
         .type = float
-        .help = "Min beta value for optimization"
+        .help = "Min beta (1/us)"
     max_beta = 1.0
         .type = float
-        .help = "Max beta value for optimization"
+        .help = "Max beta (1/us)"
     min_A = 1.0
         .type = float
         .help = "Min A value for optimization"
@@ -194,17 +201,51 @@ profile_1d_ibix{
         .help = "Max A value for optimization"
     n_restarts = 100
         .type = int(value_min=0)
-        .help = "If fit fails, number of additional attempts with perturbed params"
-
+        .help = "If a fit fails, number of additional attempts with perturbed"
+                "params"
+    min_correlation = 0.9
+        .type = float(value_min=0, value_max=1)
+        .help = "Correlation with the data a free fit must reach to be accepted."
+    peak_tolerance = None
+        .type = float(value_min=0)
+        .help = "How far in us a fit's peak may sit from the tallest channel of"
+                "the data. None: three bins, whatever their width. A time does"
+                "not shrink as the slices get finer; on MANDI's 101 us bins 300"
+                "is the same three bins."
+    peak_height_smoothing = 0.0
+        .type = float(value_min=0)
+        .help = "Time in us to smooth the data over before measuring its peak"
+                "height; 0 compares against the raw maximum. On finely sliced"
+                "data the tallest single channel sits above the curve it is"
+                "drawn from and no correct fit can reach it."
+    peak_height_fraction = 0.1
+        .type = float(value_min=0)
+        .help = "Allowed relative difference between a fit's peak height and the"
+                "height of the data."
+    library{
+        build = False
+            .type = bool
+            .help = "Measure the shape on strong reflections, and fit every"
+                    "reflection with the shape of the nearest of those held"
+                    "fixed, so that a weak reflection is never asked to"
+                    "determine a shape its counts cannot support. Needed for"
+                    "overlaps.mode=deconvolve and overlaps.estimator=joint."
+        min_i_sigma = 5.0
+            .type = float(value_min=0)
+            .help = "Summation I/sigma a reflection must reach for its fitted"
+                    "shape to enter the library."
+        min_correlation = 0.5
+            .type = float(value_min=0, value_max=1)
+            .help = "Correlation a free fit must reach for its shape to enter"
+                    "the library. Looser than min_correlation, because a shape"
+                    "only has to be the right shape."
+    }
 }
 profile_1d_profilelib
-    .help = "Profile fitting against a library of peak shapes measured on"
-            "strong reflections, after Mantid's IntegratePeaksProfileFitting."
-            "The shape model is the same back-to-back exponential"
-            "profile_1d_ibix fits; the difference is that a weak reflection"
-            "takes the shape of the nearest strong one and fits only its"
-            "amplitude and position, rather than being asked to determine a"
-            "shape its own counts cannot support."
+    .help = "Deprecated: method=profile_1d_profilelib is profile_1d_ibix with"
+            "library.build=True and the parameters below, which are the"
+            "values recommended there for MANDI. Use profile_1d_ibix."
+    .expert_level = 2
 {
     init_alpha = 0.03
         .type = float
@@ -397,70 +438,118 @@ profile_3d_ic{
         .help = "Scales the per-reflection dXdt/dYdt bounds relative to the "
                 "shoebox's spatial extent divided by its ToF extent"
 }
-profile_3d_ibix{
+profile_3d_ibix
+    .help = "The iBIX line shape in ToF times a bivariate Gaussian on the"
+            "detector face, whose centre may drift linearly with ToF, fitted"
+            "in 3D to the voxels of each reflection. ToF is in us, as in"
+            "profile_1d_ibix. With library.build, every parameter is fitted"
+            "on reflections strong enough to determine it, and every"
+            "reflection is fitted with the shape of the nearest of those held"
+            "fixed. The defaults suit a long-pulse source such as ISIS SXD."
+            "For a short-pulse source such as MANDI use min_alpha=1e-5"
+            "max_alpha=10 min_beta=1e-5 max_beta=10 min_sig_x=0.2"
+            "min_sig_y=0.2 min_sig_p=-0.95 max_sig_p=0.95 n_restarts=10"
+            "library.build=True."
+{
     init_alpha = 0.03
         .type = float
-        .help = "Initial alpha value before optimization"
+        .help = "Initial alpha (1/us) of a fit"
     min_alpha = 0.02
         .type = float
-        .help = "Min alpha value for optimization"
+        .help = "Min alpha (1/us)"
     max_alpha = 1.0
         .type = float
-        .help = "Max alpha value for optimization"
+        .help = "Max alpha (1/us)"
     init_beta = 0.03
         .type = float
-        .help = "Initial beta value before optimization"
+        .help = "Initial beta (1/us) of a fit"
     min_beta = 0.0
         .type = float
-        .help = "Min beta value for optimization"
+        .help = "Min beta (1/us)"
     max_beta = 1.0
         .type = float
-        .help = "Max beta value for optimization"
-    min_sigma = 0.1
-        .type = float
-        .help = "Min instrument-resolution Gaussian width for optimization"
-    max_sigma = 20.0
-        .type = float
-        .help = "Max instrument-resolution Gaussian width for optimization"
+        .help = "Max beta (1/us)"
     min_sig_x = 0.05
         .type = float
-        .help = "Min bivariate Gaussian sigma X for optimization"
+        .help = "Min bivariate Gaussian sigma x (px)"
     max_sig_x = 20.0
         .type = float
-        .help = "Max bivariate Gaussian sigma X for optimization"
+        .help = "Max bivariate Gaussian sigma x (px)"
     min_sig_y = 0.05
         .type = float
-        .help = "Min bivariate Gaussian sigma Y for optimization"
+        .help = "Min bivariate Gaussian sigma y (px)"
     max_sig_y = 20.0
         .type = float
-        .help = "Max bivariate Gaussian sigma Y for optimization"
-    init_sig_p = 0.0
-        .type = float
-        .help = "Initial bivariate Gaussian spatial correlation before optimization"
+        .help = "Max bivariate Gaussian sigma y (px)"
     min_sig_p = -0.99
         .type = float
-        .help = "Min bivariate Gaussian spatial correlation for optimization"
+        .help = "Min bivariate Gaussian correlation"
     max_sig_p = 0.99
         .type = float
-        .help = "Max bivariate Gaussian spatial correlation for optimization"
+        .help = "Max bivariate Gaussian correlation"
+    max_drift_factor = 1.5
+        .type = float(value_min=0)
+        .help = "Bound on how fast the peak centre may move across the"
+                "detector with ToF: this times the box's extent in pixels"
+                "over its extent in ToF. 0 holds the centre fixed."
     n_restarts = 100
         .type = int(value_min=0)
-        .help = "If fit fails, number of additional attempts with perturbed params"
-    max_drift_factor = 1.5
-        .type = float
-        .help = "Scales the per-reflection dXdt/dYdt bounds relative to the "
-                "shoebox's spatial extent divided by its ToF extent"
+        .help = "If a fit fails, number of further attempts from perturbed"
+                "starting points"
+    min_correlation = 0.75
+        .type = float(value_min=0, value_max=1)
+        .help = "Correlation between model and data over every voxel of the box"
+                "that a reflection fitted on its own must reach to be accepted."
+                "Over its own peak a freely placed model matches a blob of noise"
+                "as well as a weak peak; over the whole box it does not. 0"
+                "disables the test."
+    peak_height_fraction = 0.25
+        .type = float(value_min=0)
+        .help = "Allowed relative difference between the peak height of a"
+                "reflection fitted on its own and the data's tallest voxel. 0"
+                "disables the test."
+    library{
+        build = False
+            .type = bool
+            .help = "Measure the shape on strong reflections, and fit every"
+                    "reflection with the shape of the nearest of those held"
+                    "fixed. Needed for overlaps.mode=deconvolve and"
+                    "overlaps.estimator=joint."
+        min_i_sigma = 10.0
+            .type = float(value_min=0)
+            .help = "Summation I/sigma a reflection must reach for its fitted"
+                    "shape to enter the library. Higher than profile_1d_ibix's,"
+                    "because a 3D shape has eight parameters to determine"
+                    "rather than three."
+        min_correlation = 0.5
+            .type = float(value_min=0, value_max=1)
+            .help = "Correlation over the peak a free fit must reach for its"
+                    "shape to enter the library."
+        free_position_min_i_sigma = 10.0
+            .type = float
+            .help = "A reflection is first fitted at its prediction, corrected"
+                    "by the median offset the library measured on its panel,"
+                    "with only the amplitude free and the shape broadened by how"
+                    "far the library's own peaks scatter about their"
+                    "predictions. A weak peak's counts cannot place it: a"
+                    "position fitted to them finds the brightest noise and reads"
+                    "the intensity high. Where that first fit reaches this"
+                    "I/sigma the position is fitted as well, with the"
+                    "unbroadened shape. Only applies where the table holds"
+                    "predictions (xyzcal.px and tof_cal); otherwise every"
+                    "position is fitted."
+        position_tolerance = 3.0
+            .type = float(value_min=0)
+            .help = "How far a fitted position may move from the expected one:"
+                    "this many times the scatter of the library's own offsets"
+                    "(at least 1 px on the detector and one ToF bin)."
+    }
 }
 profile_3d_profilelib
-    .help = "3D profile fitting against a library of peak shapes measured on"
-            "strong reflections. The model is profile_3d_ibix's: the iBIX line"
-            "shape in ToF times a bivariate Gaussian on the detector face,"
-            "whose centre may drift linearly with ToF. Every parameter is"
-            "fitted on reflections strong enough to determine it; every"
-            "reflection is then fitted with the shape of the nearest of"
-            "those held fixed, and only its amplitude and position free."
-            "ToF is in us, as in profile_1d_profilelib, so alpha and beta"
-            "are in 1/us and take that method's bounds."
+    .help = "Deprecated: method=profile_3d_profilelib is profile_3d_ibix with"
+            "library.build=True and the parameters below, which are the"
+            "values recommended there for MANDI. Use profile_3d_ibix."
+    .expert_level = 2
 {
     init_alpha = 0.03
         .type = float
@@ -729,6 +818,139 @@ def get_spectrum_correction_params(**kwargs: Dict) -> Tuple:
     return incident_params, absorption_params
 
 
+def make_profile_1d_ibix_params(
+    params: libtbx.phil.scope_extract, show_profile_failures: bool
+) -> object:
+    """
+    The fitter parameters for profile_1d_ibix, or for the deprecated
+    profile_1d_profilelib: profile_1d_ibix with the library built, and the
+    parameters of its own scope, which are the values recommended for MANDI.
+    """
+    if params.method == "profile_1d_profilelib":
+        logger.warning(
+            "    method=profile_1d_profilelib is deprecated: use"
+            " method=profile_1d_ibix profile_1d_ibix.library.build=True"
+            " (see profile_1d_ibix's help for the MANDI parameters)"
+        )
+        name = "profile_1d_profilelib"
+        p = params.profile_1d_profilelib
+        build_library = True
+        # Free fits were held to the library's threshold
+        min_correlation = p.library.min_correlation
+        peak_tolerance = p.peak_tolerance
+    else:
+        name = "profile_1d_ibix"
+        p = params.profile_1d_ibix
+        build_library = p.library.build
+        min_correlation = p.min_correlation
+        # 0: three bins
+        peak_tolerance = p.peak_tolerance if p.peak_tolerance is not None else 0.0
+    for v in ("alpha", "beta", "A"):
+        if getattr(p, f"min_{v}") > getattr(p, f"max_{v}"):
+            raise ValueError(f"{name}.min_{v} > {name}.max_{v}")
+    if build_library:
+        logger.info(
+            "    Measuring peak shapes on reflections with I/sigma >= "
+            f"{p.library.min_i_sigma} whose fit correlates >= "
+            f"{p.library.min_correlation}, then holding them fixed elsewhere"
+        )
+    # dict needed due to boost limit of 15 template arguments
+    return TOFProfile1DProfilelibParams(
+        {
+            "A_min": p.min_A,
+            "A_max": p.max_A,
+            "alpha": p.init_alpha,
+            "alpha_min": p.min_alpha,
+            "alpha_max": p.max_alpha,
+            "beta": p.init_beta,
+            "beta_min": p.min_beta,
+            "beta_max": p.max_beta,
+            "n_restarts": p.n_restarts,
+            "optimize_profile": True,
+            "show_profile_failures": show_profile_failures,
+            "peak_height_smoothing": p.peak_height_smoothing,
+            "trust_min_corr": min_correlation,
+            "trust_peak_tolerance": peak_tolerance,
+            "trust_peak_height_fraction": p.peak_height_fraction,
+            "library_min_i_sigma": p.library.min_i_sigma,
+            "library_min_corr": p.library.min_correlation,
+            "build_library": build_library,
+        }
+    )
+
+
+def make_profile_3d_ibix_params(
+    params: libtbx.phil.scope_extract, show_profile_failures: bool
+) -> object:
+    """
+    The fitter parameters for profile_3d_ibix, or for the deprecated
+    profile_3d_profilelib: profile_3d_ibix with the library built, and the
+    parameters of its own scope, which are the values recommended for MANDI.
+    """
+    if params.method == "profile_3d_profilelib":
+        logger.warning(
+            "    method=profile_3d_profilelib is deprecated: use"
+            " method=profile_3d_ibix profile_3d_ibix.library.build=True"
+            " (see profile_3d_ibix's help for the MANDI parameters)"
+        )
+        name = "profile_3d_profilelib"
+        p = params.profile_3d_profilelib
+        build_library = True
+        # Free fits were held to the library's threshold
+        min_correlation = p.library.min_correlation
+        free_position_min_i_sigma = p.free_position_min_i_sigma
+        position_tolerance = p.position_tolerance
+        box_min_correlation = 0.0
+        peak_height_fraction = 0.0
+    else:
+        name = "profile_3d_ibix"
+        p = params.profile_3d_ibix
+        build_library = p.library.build
+        # Over the peak, as for the library; over the box, min_correlation
+        min_correlation = p.library.min_correlation
+        free_position_min_i_sigma = p.library.free_position_min_i_sigma
+        position_tolerance = p.library.position_tolerance
+        box_min_correlation = p.min_correlation
+        peak_height_fraction = p.peak_height_fraction
+    for v in ("alpha", "beta", "sig_x", "sig_y", "sig_p"):
+        if getattr(p, f"min_{v}") >= getattr(p, f"max_{v}"):
+            raise ValueError(f"{name}.min_{v} must be below max_{v}")
+    if build_library:
+        logger.info(
+            "    Measuring 3D peak shapes on reflections with I/sigma >= "
+            f"{p.library.min_i_sigma} whose fit correlates >= "
+            f"{p.library.min_correlation}, then holding them fixed elsewhere"
+        )
+    # dict needed due to boost limit of 15 template arguments
+    return TOFProfile3DProfilelibParams(
+        {
+            "alpha": p.init_alpha,
+            "alpha_min": p.min_alpha,
+            "alpha_max": p.max_alpha,
+            "beta": p.init_beta,
+            "beta_min": p.min_beta,
+            "beta_max": p.max_beta,
+            "SigX_min": p.min_sig_x,
+            "SigX_max": p.max_sig_x,
+            "SigY_min": p.min_sig_y,
+            "SigY_max": p.max_sig_y,
+            "SigP_min": p.min_sig_p,
+            "SigP_max": p.max_sig_p,
+            "max_drift_factor": p.max_drift_factor,
+            "n_restarts": p.n_restarts,
+            "show_profile_failures": show_profile_failures,
+            "library_min_i_sigma": p.library.min_i_sigma,
+            "library_min_corr": p.library.min_correlation,
+            "position_tolerance": position_tolerance,
+            "free_position_min_i_sigma": free_position_min_i_sigma,
+            "min_corr": min_correlation,
+            "free_fit_box_min_corr": box_min_correlation,
+            "free_fit_peak_height_fraction": peak_height_fraction,
+            "build_library": build_library,
+        }
+    )
+
+
 def integrate_reflection_table_for_experiment(
     expt: Experiment,
     expt_reflections: flex.reflection_table,
@@ -752,67 +974,9 @@ def integrate_reflection_table_for_experiment(
     logger.info(f"    Integrating using {params.method}")
 
     show_profile_failures = logger.getEffectiveLevel() == logging.DEBUG
-    if params.method == "profile_1d_ibix":
-        alpha = params.profile_1d_ibix.init_alpha
-        beta = params.profile_1d_ibix.init_beta
-        min_A = params.profile_1d_ibix.min_A
-        max_A = params.profile_1d_ibix.max_A
-        if min_A > max_A:
-            raise ValueError(
-                f"profile_1d_ibix.min_A ({min_A}) is larger than "
-                f"profile_1d_ibix.max_A ({max_A})"
-            )
-        min_alpha = params.profile_1d_ibix.min_alpha
-        max_alpha = params.profile_1d_ibix.max_alpha
-        min_beta = params.profile_1d_ibix.min_beta
-        max_beta = params.profile_1d_ibix.max_beta
-        n_restarts = params.profile_1d_ibix.n_restarts
-        profile_1d_ibix_params = TOFProfile1DIBIXParams(
-            min_A,
-            max_A,
-            alpha,
-            min_alpha,
-            max_alpha,
-            beta,
-            min_beta,
-            max_beta,
-            n_restarts,
-            True,
-            show_profile_failures,
-        )
-    elif params.method == "profile_1d_profilelib":
-        p = params.profile_1d_profilelib
-        if p.min_alpha > p.max_alpha:
-            raise ValueError("profile_1d_profilelib.min_alpha > max_alpha")
-        if p.min_beta > p.max_beta:
-            raise ValueError("profile_1d_profilelib.min_beta > max_beta")
-        if p.min_A > p.max_A:
-            raise ValueError("profile_1d_profilelib.min_A > max_A")
-        logger.info(
-            "    Measuring peak shapes on reflections with I/sigma >= "
-            f"{p.library.min_i_sigma} whose fit correlates >= "
-            f"{p.library.min_correlation}, then holding them fixed elsewhere"
-        )
-        profile_1d_profilelib_params = TOFProfile1DProfilelibParams(
-            {
-                "A_min": p.min_A,
-                "A_max": p.max_A,
-                "alpha": p.init_alpha,
-                "alpha_min": p.min_alpha,
-                "alpha_max": p.max_alpha,
-                "beta": p.init_beta,
-                "beta_min": p.min_beta,
-                "beta_max": p.max_beta,
-                "n_restarts": p.n_restarts,
-                "optimize_profile": True,
-                "show_profile_failures": show_profile_failures,
-                "peak_height_smoothing": p.peak_height_smoothing,
-                "trust_min_corr": p.library.min_correlation,
-                "trust_peak_tolerance": p.peak_tolerance,
-                "trust_peak_height_fraction": p.peak_height_fraction,
-                "library_min_i_sigma": p.library.min_i_sigma,
-                "library_min_corr": p.library.min_correlation,
-            }
+    if params.method in ("profile_1d_ibix", "profile_1d_profilelib"):
+        profile_1d_profilelib_params = make_profile_1d_ibix_params(
+            params, show_profile_failures
         )
     elif params.method == "profile_1d_ic":
         p = params.profile_1d_ic
@@ -887,67 +1051,9 @@ def integrate_reflection_table_for_experiment(
                 "show_profile_failures": show_profile_failures,
             }
         )
-    elif params.method == "profile_3d_ibix":
-        p = params.profile_3d_ibix
-        # dict needed due to boost limit of 15 template arguments
-        profile_3d_ibix_params = TOFProfile3DIBIXParams(
-            {
-                "alpha": p.init_alpha,
-                "alpha_min": p.min_alpha,
-                "alpha_max": p.max_alpha,
-                "beta": p.init_beta,
-                "beta_min": p.min_beta,
-                "beta_max": p.max_beta,
-                "sigma_min": p.min_sigma,
-                "sigma_max": p.max_sigma,
-                "SigX_min": p.min_sig_x,
-                "SigX_max": p.max_sig_x,
-                "SigY_min": p.min_sig_y,
-                "SigY_max": p.max_sig_y,
-                "SigP": p.init_sig_p,
-                "SigP_min": p.min_sig_p,
-                "SigP_max": p.max_sig_p,
-                "n_restarts": p.n_restarts,
-                "optimize_profile": True,
-                "max_drift_factor": p.max_drift_factor,
-                "show_profile_failures": show_profile_failures,
-            }
-        )
-    elif params.method == "profile_3d_profilelib":
-        p = params.profile_3d_profilelib
-        for name in ("alpha", "beta", "sig_x", "sig_y", "sig_p"):
-            if getattr(p, f"min_{name}") >= getattr(p, f"max_{name}"):
-                raise ValueError(
-                    f"profile_3d_profilelib.min_{name} must be below max_{name}"
-                )
-        logger.info(
-            "    Measuring 3D peak shapes on reflections with I/sigma >= "
-            f"{p.library.min_i_sigma} whose fit correlates >= "
-            f"{p.library.min_correlation}, then holding them fixed elsewhere"
-        )
-        # dict needed due to boost limit of 15 template arguments
-        profile_3d_profilelib_params = TOFProfile3DProfilelibParams(
-            {
-                "alpha": p.init_alpha,
-                "alpha_min": p.min_alpha,
-                "alpha_max": p.max_alpha,
-                "beta": p.init_beta,
-                "beta_min": p.min_beta,
-                "beta_max": p.max_beta,
-                "SigX_min": p.min_sig_x,
-                "SigX_max": p.max_sig_x,
-                "SigY_min": p.min_sig_y,
-                "SigY_max": p.max_sig_y,
-                "SigP_min": p.min_sig_p,
-                "SigP_max": p.max_sig_p,
-                "max_drift_factor": p.max_drift_factor,
-                "n_restarts": p.n_restarts,
-                "show_profile_failures": show_profile_failures,
-                "library_min_i_sigma": p.library.min_i_sigma,
-                "library_min_corr": p.library.min_correlation,
-                "position_tolerance": p.position_tolerance,
-                "free_position_min_i_sigma": p.free_position_min_i_sigma,
-            }
+    elif params.method in ("profile_3d_ibix", "profile_3d_profilelib"):
+        profile_3d_profilelib_params = make_profile_3d_ibix_params(
+            params, show_profile_failures
         )
 
     if apply_lorentz:
@@ -1114,9 +1220,9 @@ def calibrate_joint_fit(
     profile fit, as their median ratio over strong reflections that are in no
     cluster, each put through the joint fit on its own.
 
-    With profile_1d_profilelib the own fit is to the ToF projection, and the
+    With profile_1d_ibix the own fit is to the ToF projection, and the
     two extrapolate the tails of a peak differently, so they do not return the
-    same number for the same reflection. With profile_3d_profilelib both are
+    same number for the same reflection. With profile_3d_ibix both are
     3D fits with the same shapes, and the ratio should be close to 1. Without this the
     deconvolved reflections would sit on a different scale from the rest of
     the table. The spread of the ratio is logged: it is a direct measure of how
@@ -1271,7 +1377,7 @@ def fit_profiles_jointly(
 
     The method's own profile fit is kept as intensity.prf_1d.value / .variance
     (variance -1 where it failed; the name is from when only
-    profile_1d_profilelib could be used here). A reflection the joint fit
+    the 1D library method could be used here). A reflection the joint fit
     cannot fit loses its profile-fitted intensity rather than keep its own,
     which would mix the two estimators again.
     """
@@ -1819,19 +1925,23 @@ def run_integrate(
     if params.mp.nproc is libtbx.Auto:
         params.mp.nproc = multiprocessing.cpu_count()
 
-    library_methods = ("profile_1d_profilelib", "profile_3d_profilelib")
-    if params.overlaps.mode == "deconvolve" and params.method not in library_methods:
-        raise ValueError(
-            "overlaps.mode=deconvolve takes its peak shapes from the profile"
-            " library, and requires method=profile_1d_profilelib or"
-            " profile_3d_profilelib"
-        )
-    if params.overlaps.estimator == "joint" and params.method not in library_methods:
-        raise ValueError(
-            "overlaps.estimator=joint takes its peak shapes from the profile"
-            " library, and requires method=profile_1d_profilelib or"
-            " profile_3d_profilelib"
-        )
+    builds_library = params.method in (
+        "profile_1d_profilelib",
+        "profile_3d_profilelib",
+    ) or (
+        params.method in ("profile_1d_ibix", "profile_3d_ibix")
+        and getattr(params, params.method).library.build
+    )
+    for option, active in (
+        ("overlaps.mode=deconvolve", params.overlaps.mode == "deconvolve"),
+        ("overlaps.estimator=joint", params.overlaps.estimator == "joint"),
+    ):
+        if active and not builds_library:
+            raise ValueError(
+                f"{option} takes its peak shapes from the profile library, and"
+                " requires method=profile_1d_ibix or profile_3d_ibix with"
+                " library.build=True"
+            )
 
     reflections, _ = process_reference(reflections)
 

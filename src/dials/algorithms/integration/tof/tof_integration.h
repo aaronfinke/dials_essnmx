@@ -959,7 +959,7 @@ namespace dials { namespace algorithms {
           min_corr_(params.library_min_corr) {}
 
     bool needs_two_passes() const override {
-      return true;
+      return params_.build_library;
     }
 
     // Pass one: fit freely, and keep the shape if the reflection is strong
@@ -1054,7 +1054,7 @@ namespace dials { namespace algorithms {
       return true;
     }
 
-    // Only reached if the library is empty
+    // Every reflection, without a library
     bool fit(const ShoeboxIntegrationResult& shoebox_result,
              double& I_prf,
              double& var_prf) override {
@@ -1198,7 +1198,7 @@ namespace dials { namespace algorithms {
         : params_(params) {}
 
     bool needs_two_passes() const override {
-      return true;
+      return params_.build_library;
     }
 
     void collect(const ShoeboxIntegrationResult& shoebox_result,
@@ -1302,8 +1302,13 @@ namespace dials { namespace algorithms {
              double& I_prf,
              double& var_prf) override {
       var_prf = shoebox_result.variance;
-      Profile3DFitResult result = fit_profile_3d_profilelib_shape(
-        profile_3d_data(shoebox_result), params_, params_.library_min_corr);
+      Profile3DFitResult result =
+        fit_profile_3d_profilelib_shape(profile_3d_data(shoebox_result),
+                                        params_,
+                                        params_.min_corr,
+                                        2,
+                                        params_.free_fit_box_min_corr,
+                                        params_.free_fit_peak_height_fraction);
       if (!result.success) {
         return false;
       }

@@ -278,15 +278,24 @@ def test_mask_mode_keeps_overlapped_reflections(sxd_nacl):
         )
 
 
-@pytest.mark.parametrize("method", ["profile_1d_profilelib", "profile_3d_profilelib"])
+LIBRARY_METHODS = [
+    ("method=profile_1d_ibix", "profile_1d_ibix.library.build=True"),
+    ("method=profile_3d_ibix", "profile_3d_ibix.library.build=True"),
+]
+
+
+@pytest.mark.parametrize("method", LIBRARY_METHODS, ids=["1d", "3d"])
 def test_deconvolve_mode(sxd_nacl, method):
     with pytest.raises(ValueError):
         integrate(sxd_nacl, "overlaps.mode=deconvolve", "method=summation")
+    # A profile method needs its library
+    with pytest.raises(ValueError):
+        integrate(sxd_nacl, "overlaps.mode=deconvolve", method[0])
 
     # Boxes and foregrounds large enough for some foregrounds to overlap
     settings = [
         "overlaps.mode=deconvolve",
-        f"method={method}",
+        *method,
         "bbox_xy_padding=10",
         "bbox_tof_padding=4",
         "ellipse_mask.scale=2",
@@ -313,7 +322,7 @@ def test_deconvolve_mode(sxd_nacl, method):
     )
 
 
-@pytest.mark.parametrize("method", ["profile_1d_profilelib", "profile_3d_profilelib"])
+@pytest.mark.parametrize("method", LIBRARY_METHODS, ids=["1d", "3d"])
 @pytest.mark.parametrize("mode", ["mask", "deconvolve"])
 def test_joint_estimator(sxd_nacl, mode, method):
     with pytest.raises(ValueError):
@@ -322,7 +331,7 @@ def test_joint_estimator(sxd_nacl, mode, method):
     settings = [
         f"overlaps.mode={mode}",
         "overlaps.estimator=joint",
-        f"method={method}",
+        *method,
         "bbox_xy_padding=10",
         "bbox_tof_padding=4",
         "ellipse_mask.scale=2",
