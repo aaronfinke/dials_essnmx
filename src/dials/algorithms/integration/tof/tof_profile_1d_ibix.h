@@ -6,6 +6,7 @@
 #include <limits>
 #include <array>
 #include <cassert>
+#include <numeric>
 #include <dials/array_family/scitbx_shared_and_versa.h>
 #include <random>
 #include "tof_utils.h"
@@ -19,51 +20,17 @@ Yano, N., Yamada, T., Hosoya, T. et al.
 Application of profile fitting method to neutron time-of-flight protein
 single crystal diffraction data collected at the iBIX. Sci Rep 6,
 36628 (2016). https://doi.org/10.1038/srep36628
+
+profile_1d_ibix fits the back-to-back exponential line shape to the ToF
+projection of a reflection. Parameter bounds are imposed by reparameterisation
+rather than by clamping, and the acceptance tests take a time tolerance and a
+smoothed peak height where the slices are fine (a fixed three bins and the
+tallest channel otherwise). With a library (see Profile1DIBIXFitter in
+tof_integration.h), the shape is measured only where the counts determine it
+and reused elsewhere, after Mantid's IntegratePeaksProfileFitting.
 */
+
 namespace dials { namespace algorithms {
-
-  /*
-   * Holds params required for profile1d
-   */
-  struct TOFProfile1DIBIXParams {
-    double A;
-    double A_min;
-    double A_max;
-    double alpha;
-    double alpha_min;
-    double alpha_max;
-    double beta;
-    double beta_min;
-    double beta_max;
-    int n_restarts;              // number of attempts when fitting
-    bool optimize_profile;       // If false the profile is generated with input params
-    bool show_profile_failures;  // Prints debugging information
-
-    TOFProfile1DIBIXParams(double A_min,
-                           double A_max,
-                           double alpha,
-                           double alpha_min,
-                           double alpha_max,
-                           double beta,
-                           double beta_min,
-                           double beta_max,
-                           int n_restarts,
-                           bool optimize_profile,
-                           bool show_profile_failures)
-
-        : A(A_min),
-          A_min(A_min),
-          A_max(A_max),
-          alpha(alpha),
-          alpha_min(alpha_min),
-          alpha_max(alpha_max),
-          beta(beta),
-          beta_min(beta_min),
-          beta_max(beta_max),
-          n_restarts(n_restarts),
-          optimize_profile(optimize_profile),
-          show_profile_failures(show_profile_failures) {}
-  };
 
   static scitbx::af::shared<double> profile1d_func(scitbx::af::const_ref<double> tof,
                                                    double A,
@@ -101,17 +68,167 @@ namespace dials { namespace algorithms {
     return out;
   }
 
-  struct IBIXProfileFunctor {
+  /*
+   * A peak shape, as fitted on one reflection and reusable on another.  Held
+   * separately from TOFProfile1DIBIXParams so that a library can be built
+   * from many reflections without mutating shared fitting parameters.
+   */
+  struct IBIXShape {
+    double alpha = 0.0;
+    double beta = 0.0;
+    double sigma = 0.0;
+    double T_ph = 0.0;  // fitted peak position (us) on the reflection it came from
+    bool valid = false;
+  };
+
+  /*
+   * Everything profile_1d_ibix needs: the shape fit, the acceptance thresholds,
+   * and whether to build a library and which reflections may contribute a
+   * shape to it.
+   */
+  struct TOFProfile1DIBIXParams {
+    double A;
+    double A_min;
+    double A_max;
+    double alpha;
+    double alpha_min;
+    double alpha_max;
+    double beta;
+    double beta_min;
+    double beta_max;
+    int n_restarts;
+    bool optimize_profile;
+    bool show_profile_failures;
+    double peak_height_smoothing;  // Time to smooth over before measuring the data peak
+    double trust_min_corr;         // Correlation with the data a shape fit must reach
+    double
+      trust_peak_tolerance;  // How far in us the fitted peak may sit from the data's
+    double trust_peak_height_fraction;  // Allowed relative error on the peak height
+    double library_min_i_sigma;  // Summation I/sigma a shape's reflection must reach
+    double library_min_corr;     // Correlation its free fit must reach
+    // Measure shapes on strong reflections and fit the rest with them (two
+    // passes); without, every reflection is fitted freely on its own
+    bool build_library = true;
+
+    TOFProfile1DIBIXParams(double A_min,
+                           double A_max,
+                           double alpha,
+                           double alpha_min,
+                           double alpha_max,
+                           double beta,
+                           double beta_min,
+                           double beta_max,
+                           int n_restarts,
+                           bool optimize_profile,
+                           bool show_profile_failures,
+                           double peak_height_smoothing,
+                           double trust_min_corr,
+                           double trust_peak_tolerance,
+                           double trust_peak_height_fraction,
+                           double library_min_i_sigma,
+                           double library_min_corr)
+        : A(A_min),
+          A_min(A_min),
+          A_max(A_max),
+          alpha(alpha),
+          alpha_min(alpha_min),
+          alpha_max(alpha_max),
+          beta(beta),
+          beta_min(beta_min),
+          beta_max(beta_max),
+          n_restarts(n_restarts),
+          optimize_profile(optimize_profile),
+          show_profile_failures(show_profile_failures),
+          peak_height_smoothing(peak_height_smoothing),
+          trust_min_corr(trust_min_corr),
+          trust_peak_tolerance(trust_peak_tolerance),
+          trust_peak_height_fraction(trust_peak_height_fraction),
+          library_min_i_sigma(library_min_i_sigma),
+          library_min_corr(library_min_corr) {}
+  };
+
+  /*
+   * The amplitude enters the model linearly, so for a given shape and position
+   * the best A is a one-line least squares rather than something to search for:
+   * A* = sum(y g) / sum(g g), with g the same profile at unit amplitude.  Used
+   * to seed the fit, because until A is roughly right the model is flat
+   * compared with the data and the gradient with respect to the peak position
+   * all but vanishes, which leaves the optimiser unable to find the peak.
+   */
+  static double analytic_amplitude(scitbx::af::const_ref<double> tof,
+                                   scitbx::af::const_ref<double> y_norm,
+                                   double alpha,
+                                   double beta,
+                                   double sigma,
+                                   double T_ph) {
+    scitbx::af::shared<double> g = profile1d_func(tof, 1.0, alpha, beta, sigma, T_ph);
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < g.size(); ++i) {
+      if (!is_finite_double(g[i])) {
+        continue;
+      }
+      num += y_norm[i] * g[i];
+      den += g[i] * g[i];
+    }
+    if (!(den > 0.0) || !is_finite_double(num)) {
+      return 1.0;
+    }
+    double a = num / den;
+    return is_finite_double(a) && a > 0.0 ? a : 1.0;
+  }
+
+  /*
+   * Bounds by reparameterisation rather than by clamping.
+   *
+   * Eigen's LevenbergMarquardt is unconstrained.  Imposing bounds by clamping
+   * the parameter vector inside the residual and the Jacobian, as this file
+   * used to, makes the model constant outside the box: the optimiser then sees
+   * no change from a step that leaves it, a parameter sitting on a bound gets a
+   * zero Jacobian column, and the trust region has no direction to move in.
+   * Instead every bounded parameter is carried internally as an unbounded
+   * variable u, with p = lo + (hi - lo) / (1 + exp(-u)).  The map is smooth and
+   * strictly monotone, every u is feasible, and the optimisation is genuinely
+   * unconstrained, so the bounds cost nothing in conditioning.
+   */
+  inline double bounded_to_internal(double p, double lo, double hi) {
+    double span = hi - lo;
+    if (!(span > 0.0)) {
+      return 0.0;
+    }
+    double frac = (p - lo) / span;
+    // Keep strictly inside, or the logit is infinite
+    const double eps = 1e-9;
+    frac = std::min(std::max(frac, eps), 1.0 - eps);
+    return std::log(frac / (1.0 - frac));
+  }
+
+  inline double internal_to_bounded(double u, double lo, double hi) {
+    double span = hi - lo;
+    if (!(span > 0.0)) {
+      return lo;
+    }
+    // Logistic, written to avoid overflow for either sign of u
+    double frac;
+    if (u >= 0.0) {
+      frac = 1.0 / (1.0 + std::exp(-u));
+    } else {
+      double e = std::exp(u);
+      frac = e / (1.0 + e);
+    }
+    return lo + span * frac;
+  }
+
+  struct IBIXShapeFunctor {
     scitbx::af::const_ref<double> tof;
     scitbx::af::const_ref<double> y_norm;  // Assumed normalized
     std::array<double, 5> min_bounds;      // parameter bounds
     std::array<double, 5> max_bounds;      // parameter bounds
     int num_data_points, num_params;
 
-    IBIXProfileFunctor(scitbx::af::const_ref<double> tof_,
-                       scitbx::af::const_ref<double> y_norm_,
-                       const std::array<double, 5>& minb,
-                       const std::array<double, 5>& maxb)
+    IBIXShapeFunctor(scitbx::af::const_ref<double> tof_,
+                     scitbx::af::const_ref<double> y_norm_,
+                     const std::array<double, 5>& minb,
+                     const std::array<double, 5>& maxb)
         : tof(tof_), y_norm(y_norm_) {
       min_bounds = minb;
       max_bounds = maxb;
@@ -127,24 +244,27 @@ namespace dials { namespace algorithms {
       return num_params;
     }
 
-    inline Eigen::VectorXd clamp_params(const Eigen::VectorXd& x) const {
-      Eigen::VectorXd xc = x;
-      for (int i = 0; i < x.size(); ++i) {
-        xc[i] = std::min(std::max(x[i], min_bounds[i]), max_bounds[i]);
+    // The optimiser's vector is internal; these convert to and from parameters
+    Eigen::VectorXd to_internal(const Eigen::VectorXd& p) const {
+      Eigen::VectorXd u(num_params);
+      for (int i = 0; i < num_params; ++i) {
+        u[i] = bounded_to_internal(p[i], min_bounds[i], max_bounds[i]);
       }
-      return xc;
+      return u;
     }
 
-    int operator()(const Eigen::VectorXd& x, Eigen::VectorXd& fvec) const {
-      Eigen::VectorXd xc = clamp_params(x);
-      double A = xc[0];
-      double alpha = xc[1];
-      double beta = xc[2];
-      double sigma = xc[3];
-      double T_ph = xc[4];
+    Eigen::VectorXd to_params(const Eigen::VectorXd& u) const {
+      Eigen::VectorXd p(num_params);
+      for (int i = 0; i < num_params; ++i) {
+        p[i] = internal_to_bounded(u[i], min_bounds[i], max_bounds[i]);
+      }
+      return p;
+    }
 
+    int operator()(const Eigen::VectorXd& u, Eigen::VectorXd& fvec) const {
+      Eigen::VectorXd x = to_params(u);
       scitbx::af::shared<double> model =
-        profile1d_func(tof, A, alpha, beta, sigma, T_ph);
+        profile1d_func(tof, x[0], x[1], x[2], x[3], x[4]);
       assert(model.size() == num_data_points);
       for (int i = 0; i < num_data_points; ++i) {
         fvec[i] = y_norm[i] - model[i];
@@ -152,33 +272,110 @@ namespace dials { namespace algorithms {
       return 0;
     }
 
-    int df(const Eigen::VectorXd& x, Eigen::MatrixXd& J) const {
+    int df(const Eigen::VectorXd& u, Eigen::MatrixXd& J) const {
+      // Central differences in the internal variable, where every step is
+      // feasible and no clamping can flatten a column
       const double eps = 1e-5;
-      Eigen::VectorXd xc = clamp_params(x);
       J.resize(num_data_points, num_params);
 
       for (int j = 0; j < num_params; ++j) {
-        // Perturb param
-        double delta = eps * std::max(1.0, std::abs(xc[j]));
-        Eigen::VectorXd xp = xc, xm = xc;
-        xp[j] += delta;
-        xm[j] -= delta;
-
-        Eigen::VectorXd xpc = clamp_params(xp);
-        Eigen::VectorXd xmc = clamp_params(xm);
-
-        double step = xpc[j] - xmc[j];
-        if (std::abs(step) < 1e-14) {
-          J.col(j).setZero();
-          continue;
-        }
+        double delta = eps * std::max(1.0, std::abs(u[j]));
+        Eigen::VectorXd up = u, um = u;
+        up[j] += delta;
+        um[j] -= delta;
 
         Eigen::VectorXd fp(num_data_points), fm(num_data_points);
-        operator()(xpc, fp);
-        operator()(xmc, fm);
+        operator()(up, fp);
+        operator()(um, fm);
+        J.col(j) = (fp - fm) / (2.0 * delta);
+      }
 
-        // Central difference
-        J.col(j) = (fp - fm) / step;
+      return 0;
+    }
+  };
+
+  /*
+   * As IBIXShapeFunctor, but with the peak shape held fixed and only the
+   * amplitude and the peak position free.  Used when the shape comes from a
+   * profile library built on strong reflections, as in Mantid's
+   * BVGFitTools.doBVGFit with forceParams: a weak reflection has too few
+   * counts to determine its own shape, but two parameters against the same
+   * number of points are well constrained.
+   */
+  struct IBIXForcedFunctor {
+    scitbx::af::const_ref<double> tof;
+    scitbx::af::const_ref<double> y_norm;  // Assumed normalized
+    double alpha, beta, sigma;             // fixed shape
+    std::array<double, 2> min_bounds;      // bounds on A and T_ph
+    std::array<double, 2> max_bounds;
+    int num_data_points, num_params;
+
+    IBIXForcedFunctor(scitbx::af::const_ref<double> tof_,
+                      scitbx::af::const_ref<double> y_norm_,
+                      double alpha_,
+                      double beta_,
+                      double sigma_,
+                      const std::array<double, 2>& minb,
+                      const std::array<double, 2>& maxb)
+        : tof(tof_),
+          y_norm(y_norm_),
+          alpha(alpha_),
+          beta(beta_),
+          sigma(sigma_),
+          min_bounds(minb),
+          max_bounds(maxb) {
+      num_data_points = tof.size();
+      num_params = 2;
+    }
+
+    int values() const {
+      return num_data_points;
+    }
+
+    int inputs() const {
+      return num_params;
+    }
+
+    Eigen::VectorXd to_internal(const Eigen::VectorXd& p) const {
+      Eigen::VectorXd u(num_params);
+      for (int i = 0; i < num_params; ++i) {
+        u[i] = bounded_to_internal(p[i], min_bounds[i], max_bounds[i]);
+      }
+      return u;
+    }
+
+    Eigen::VectorXd to_params(const Eigen::VectorXd& u) const {
+      Eigen::VectorXd p(num_params);
+      for (int i = 0; i < num_params; ++i) {
+        p[i] = internal_to_bounded(u[i], min_bounds[i], max_bounds[i]);
+      }
+      return p;
+    }
+
+    int operator()(const Eigen::VectorXd& u, Eigen::VectorXd& fvec) const {
+      Eigen::VectorXd x = to_params(u);
+      scitbx::af::shared<double> model =
+        profile1d_func(tof, x[0], alpha, beta, sigma, x[1]);
+      for (int i = 0; i < num_data_points; ++i) {
+        fvec[i] = y_norm[i] - model[i];
+      }
+      return 0;
+    }
+
+    int df(const Eigen::VectorXd& u, Eigen::MatrixXd& J) const {
+      const double eps = 1e-5;
+      J.resize(num_data_points, num_params);
+
+      for (int j = 0; j < num_params; ++j) {
+        double delta = eps * std::max(1.0, std::abs(u[j]));
+        Eigen::VectorXd up = u, um = u;
+        up[j] += delta;
+        um[j] -= delta;
+
+        Eigen::VectorXd fp(num_data_points), fm(num_data_points);
+        operator()(up, fp);
+        operator()(um, fm);
+        J.col(j) = (fp - fm) / (2.0 * delta);
       }
 
       return 0;
@@ -195,6 +392,10 @@ namespace dials { namespace algorithms {
 
     // params
     double A, alpha, beta, sigma, T_ph;
+    double peak_height_smoothing;
+    double trust_min_corr;
+    double trust_peak_tolerance;
+    double trust_peak_height_fraction;
     std::array<double, 5> min_bounds;
     std::array<double, 5> max_bounds;
 
@@ -207,7 +408,11 @@ namespace dials { namespace algorithms {
                      const std::array<double, 2> A_bounds,
                      const std::array<double, 2> alpha_bounds,
                      const std::array<double, 2> beta_bounds,
-                     int n_restarts_)
+                     int n_restarts_,
+                     double peak_height_smoothing_,
+                     double trust_min_corr_,
+                     double trust_peak_tolerance_,
+                     double trust_peak_height_fraction_)
         : tof(tof_),
           intensities(intensities_),
           A(A_),
@@ -215,6 +420,10 @@ namespace dials { namespace algorithms {
           beta(beta_),
           sigma(1.0),
           T_ph(T_ph_),
+          peak_height_smoothing(peak_height_smoothing_),
+          trust_min_corr(trust_min_corr_),
+          trust_peak_tolerance(trust_peak_tolerance_),
+          trust_peak_height_fraction(trust_peak_height_fraction_),
           n_restarts(n_restarts_) {
       DIALS_ASSERT(tof.size() > 0);
       DIALS_ASSERT(tof.size() == intensities.size());
@@ -238,6 +447,11 @@ namespace dials { namespace algorithms {
 
       // Set initial sigma from estimating peak width
       sigma = estimate_sigma_from_fwhm(tof, y_norm.const_ref());
+
+      // Seed the amplitude at its analytic optimum for that shape
+      double A_seed =
+        analytic_amplitude(tof, y_norm.const_ref(), alpha, beta, sigma, T_ph);
+      A = std::min(std::max(A_seed, A_bounds[0]), A_bounds[1]);
 
       // Param bounds (A, alpha, beta, sigma, T_ph)
       min_bounds = {
@@ -327,6 +541,29 @@ namespace dials { namespace algorithms {
       return sigma0;
     }
 
+    double smoothed_data_peak() const {
+      const int n = static_cast<int>(y_norm.size());
+      if (n == 0) {
+        return 0.0;
+      }
+      double mean_dt = (tof.back() - tof.front()) / std::max(n - 1, 1);
+      int half_window = static_cast<int>(0.5 * peak_height_smoothing / mean_dt);
+      if (half_window < 1) {
+        return *std::max_element(y_norm.begin(), y_norm.end());
+      }
+      double best = 0.0;
+      for (int i = 0; i < n; ++i) {
+        int lo = std::max(0, i - half_window);
+        int hi = std::min(n - 1, i + half_window);
+        double total = 0.0;
+        for (int j = lo; j <= hi; ++j) {
+          total += y_norm[j];
+        }
+        best = std::max(best, total / (hi - lo + 1));
+      }
+      return best;
+    }
+
     double calc_intensity() const {
       /**
        * Get overall intensity with Simpsons rule then divide by mean_dt to
@@ -366,8 +603,8 @@ namespace dials { namespace algorithms {
       const int ndata = static_cast<int>(tof.size());
       if (ndata < 5) return false;
 
-      IBIXProfileFunctor functor(tof, y_norm.const_ref(), min_bounds, max_bounds);
-      typedef Eigen::LevenbergMarquardt<IBIXProfileFunctor, double> LM;
+      IBIXShapeFunctor functor(tof, y_norm.const_ref(), min_bounds, max_bounds);
+      typedef Eigen::LevenbergMarquardt<IBIXShapeFunctor, double> LM;
 
       auto run_single_fit = [&](const Eigen::VectorXd& x_init,
                                 double& final_error) -> bool {
@@ -376,15 +613,15 @@ namespace dials { namespace algorithms {
         lm.parameters.xtol = xtol;
         lm.parameters.ftol = ftol;
 
-        Eigen::VectorXd x = x_init;
-        int result = lm.minimize(x);
+        Eigen::VectorXd u = functor.to_internal(x_init);
+        int result = lm.minimize(u);
         if (result < 0) return false;
 
-        x = functor.clamp_params(x);
+        Eigen::VectorXd x = functor.to_params(u);
 
-        // Compute residual norm
+        // Compute residual norm (the functor takes internal variables)
         Eigen::VectorXd fvec(functor.num_data_points);
-        functor(x, fvec);
+        functor(u, fvec);
         final_error = fvec.squaredNorm();
 
         // Update fitted parameters
@@ -407,6 +644,7 @@ namespace dials { namespace algorithms {
 
       if (success) {
         I_prf = this->calc_intensity();
+        max_profile_index = this->get_max_profile_index();
         if (this->trust_result(fit_resid,
                                I_prf,
                                max_sum_index,
@@ -472,16 +710,31 @@ namespace dials { namespace algorithms {
         return false;
       }
 
-      // Check peak position close to data peak
-      int peak_delta =
-        std::abs(static_cast<int>(max_sum_index) - static_cast<int>(max_profile_index));
-      if (peak_delta > 3) {
-        if (show_error) {
-          std::cerr << "profile1d fitting failure: peak index mismatch (max_sum_index="
-                    << max_sum_index << ", max_profile_index=" << max_profile_index
-                    << ", delta=" << peak_delta << ")\n";
+      /*
+       * Check the peak position is close to the data peak.  With a tolerance in
+       * microseconds the comparison is made as a time, which does not shrink
+       * with the slice width; with none it falls back to the original fixed
+       * three bins.
+       */
+      if (trust_peak_tolerance > 0.0) {
+        double peak_delta = std::abs(tof[max_profile_index] - tof[max_sum_index]);
+        if (peak_delta > trust_peak_tolerance) {
+          if (show_error) {
+            std::cerr << "profile1d fitting failure: peak position mismatch (delta="
+                      << peak_delta << " > " << trust_peak_tolerance << ")\n";
+          }
+          return false;
         }
-        return false;
+      } else {
+        int peak_delta = std::abs(static_cast<int>(max_sum_index)
+                                  - static_cast<int>(max_profile_index));
+        if (peak_delta > 3) {
+          if (show_error) {
+            std::cerr << "profile1d fitting failure: peak index mismatch (delta="
+                      << peak_delta << ")\n";
+          }
+          return false;
+        }
       }
 
       // Check peak isn't very flat
@@ -519,7 +772,7 @@ namespace dials { namespace algorithms {
       }
 
       double corr = num / std::sqrt(denom_y * denom_m + 1e-12);
-      if (corr < 0.9) {
+      if (corr < trust_min_corr) {
         if (show_error) {
           std::cerr << "profile1d fitting failure: low correlation (corr=" << corr
                     << ")\n";
@@ -527,13 +780,23 @@ namespace dials { namespace algorithms {
         return false;
       }
 
-      // Check peak height is within 10% of data peak
-      double peak_diff = std::abs(profile_peak - data_peak);
-      if (peak_diff > data_peak * 0.1) {
+      /*
+       * Check the peak height against the data, measured on a smoothed copy so
+       * that the comparison is with the curve rather than with its noisiest
+       * channel, and so that it does not tighten as the slices get finer.
+       */
+      double reference_peak = data_peak;
+      if (peak_height_smoothing > 0.0) {
+        reference_peak = std::max(smoothed_data_peak(), 1e-12);
+      }
+      double peak_diff = std::abs(profile_peak - reference_peak);
+      if (peak_diff > reference_peak * trust_peak_height_fraction) {
         if (show_error) {
           std::cerr << "profile1d fitting failure: peak height mismatch "
-                    << "(profile_peak=" << profile_peak << ", data_peak=" << data_peak
-                    << ", diff=" << peak_diff << ")\n";
+                    << "(profile_peak=" << profile_peak
+                    << ", data_peak=" << reference_peak
+                    << ", raw_data_peak=" << data_peak << ", diff=" << peak_diff
+                    << ")\n";
         }
         return false;
       }
@@ -542,13 +805,14 @@ namespace dials { namespace algorithms {
     }
   };
 
-  bool fit_profile_1d_ibix(
+  bool fit_profile_1d_ibix_shape(
     scitbx::af::const_ref<double> projected_intensity,
     scitbx::af::const_ref<double> tof_z,
     TOFProfile1DIBIXParams& profile_params,
     double& I_prf_out,
     boost::optional<scitbx::af::shared<double>> line_profile_out = boost::none,
-    bool update_params = false) {
+    bool update_params = false,
+    IBIXShape* shape_out = nullptr) {
     /**
      * Wrapper for fitting a given reflection
      * If line_profile_out is provided the profile is returned at every
@@ -577,7 +841,11 @@ namespace dials { namespace algorithms {
                              A_bounds,
                              alpha_bounds,
                              beta_bounds,
-                             profile_params.n_restarts);
+                             profile_params.n_restarts,
+                             profile_params.peak_height_smoothing,
+                             profile_params.trust_min_corr,
+                             profile_params.trust_peak_tolerance,
+                             profile_params.trust_peak_height_fraction);
 
     bool profile_success = true;
     if (profile_params.optimize_profile) {
@@ -589,6 +857,13 @@ namespace dials { namespace algorithms {
         profile_params.alpha = profile.alpha;
         profile_params.beta = profile.beta;
         profile_params.A = profile.A;
+      }
+      if (shape_out != nullptr) {
+        shape_out->alpha = profile.alpha;
+        shape_out->beta = profile.beta;
+        shape_out->sigma = profile.sigma;
+        shape_out->T_ph = profile.T_ph;
+        shape_out->valid = true;
       }
       double I_prf = profile.calc_intensity();
       auto profile_result = profile.result();
@@ -608,6 +883,110 @@ namespace dials { namespace algorithms {
       return profile_success;
     }
     return false;
+  }
+
+  /*
+   * Fit a reflection with its peak shape taken from elsewhere, leaving only
+   * the amplitude and the peak position free.
+   *
+   * Deliberately not gated on the correlation between model and data, unlike
+   * the free fit: a forced fit has fewer parameters and so follows the noise
+   * less closely, which lowers that correlation while raising the accuracy of
+   * the intensity.  Gating on it would reject the better answer.
+   */
+  bool fit_profile_1d_ibix_forced(
+    scitbx::af::const_ref<double> projected_intensity,
+    scitbx::af::const_ref<double> tof_z,
+    const IBIXShape& shape,
+    double A_min,
+    double A_max,
+    double& I_prf_out,
+    boost::optional<scitbx::af::shared<double>> line_profile_out = boost::none) {
+    const int ndata = static_cast<int>(tof_z.size());
+    if (ndata < 5 || !shape.valid) {
+      return false;
+    }
+    if (!(shape.sigma > 0.0) || !(shape.alpha > 0.0) || !(shape.beta > 0.0)) {
+      return false;
+    }
+
+    // Normalize, as the free fitter does, so that A is on a comparable scale
+    double intensity_max =
+      *std::max_element(projected_intensity.begin(), projected_intensity.end());
+    if (!(intensity_max > 0.0)) {
+      return false;
+    }
+    scitbx::af::shared<double> y_norm(ndata);
+    for (int i = 0; i < ndata; ++i) {
+      double v = projected_intensity[i];
+      if (!is_finite_double(v) || v < 0.0) v = 0.0;
+      y_norm[i] = v / intensity_max;
+    }
+
+    // Seed the peak position at the tallest channel
+    std::size_t max_index = std::distance(
+      projected_intensity.begin(),
+      std::max_element(projected_intensity.begin(), projected_intensity.end()));
+
+    std::array<double, 2> min_bounds = {A_min, tof_z.front()};
+    std::array<double, 2> max_bounds = {A_max, tof_z.back()};
+
+    IBIXForcedFunctor functor(tof_z,
+                              y_norm.const_ref(),
+                              shape.alpha,
+                              shape.beta,
+                              shape.sigma,
+                              min_bounds,
+                              max_bounds);
+
+    double A_seed = analytic_amplitude(tof_z,
+                                       y_norm.const_ref(),
+                                       shape.alpha,
+                                       shape.beta,
+                                       shape.sigma,
+                                       tof_z[max_index]);
+    Eigen::VectorXd x(2);
+    x << std::min(std::max(A_seed, A_min), A_max), tof_z[max_index];
+
+    Eigen::LevenbergMarquardt<IBIXForcedFunctor, double> lm(functor);
+    lm.parameters.maxfev = 200;
+    lm.parameters.xtol = 1e-8;
+    lm.parameters.ftol = 1e-8;
+    Eigen::VectorXd u = functor.to_internal(x);
+    if (lm.minimize(u) < 0) {
+      return false;
+    }
+    x = functor.to_params(u);
+
+    scitbx::af::shared<double> model =
+      profile1d_func(tof_z, x[0], shape.alpha, shape.beta, shape.sigma, x[1]);
+    for (auto& v : model) {
+      v *= intensity_max;
+      if (!is_finite_double(v)) {
+        return false;
+      }
+    }
+
+    double mean_dt = (tof_z[ndata - 1] - tof_z[0]) / (ndata - 1);
+    if (!(mean_dt > 0.0)) {
+      return false;
+    }
+    double I_prf = simpson_integrate(model.const_ref(), tof_z) / mean_dt;
+    if (!is_finite_double(I_prf) || I_prf < 1e-7) {
+      return false;
+    }
+
+    I_prf_out = I_prf;
+    if (line_profile_out) {
+      scitbx::af::shared<double> line_profile = *line_profile_out;
+      if (line_profile.size() != model.size()) {
+        return false;
+      }
+      for (std::size_t i = 0; i < model.size(); ++i) {
+        line_profile[i] = model[i];
+      }
+    }
+    return true;
   }
 
 }}  // namespace dials::algorithms

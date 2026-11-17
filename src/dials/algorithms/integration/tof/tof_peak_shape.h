@@ -6,7 +6,6 @@
 #include <memory>
 #include <vector>
 #include <dials/algorithms/integration/tof/tof_profile_1d_ibix.h>
-#include <dials/algorithms/integration/tof/tof_profile_1d_profilelib.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_bvg.h>
 
 /*
@@ -77,8 +76,8 @@ namespace dials { namespace algorithms {
   /*
    * The iBIX line shape in ToF (back-to-back exponentials convolved with a
    * Gaussian) times a bivariate Gaussian on the detector face, whose centre
-   * may move linearly with ToF. Used by profile_1d_profilelib (with the face
-   * measured separately and no drift) and profile_3d_profilelib.
+   * may move linearly with ToF. Used by profile_1d_ibix (with the face
+   * measured separately and no drift) and profile_3d_ibix.
    */
   class IBIXGaussianShape : public PeakShape {
   public:
