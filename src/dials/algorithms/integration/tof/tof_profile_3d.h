@@ -1,5 +1,5 @@
-#ifndef DIALS_ALGORITHMS_INTEGRATION_TOF_PROFILE_3D_IBIX_H
-#define DIALS_ALGORITHMS_INTEGRATION_TOF_PROFILE_3D_IBIX_H
+#ifndef DIALS_ALGORITHMS_INTEGRATION_TOF_PROFILE_3D_H
+#define DIALS_ALGORITHMS_INTEGRATION_TOF_PROFILE_3D_H
 
 #include <algorithm>
 #include <cmath>
@@ -11,17 +11,19 @@
 #include <eigen3/unsupported/Eigen/NonLinearOptimization>
 #include <dials/algorithms/integration/tof/tof_peak_shape.h>
 #include <dials/algorithms/integration/tof/tof_line_shape.h>
-#include <dials/algorithms/integration/tof/tof_profile_1d_ibix.h>
+#include <dials/algorithms/integration/tof/tof_profile_1d.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_bvg.h>
 
 /*
-profile_3d_ibix fits the iBIX line shape in ToF times a bivariate Gaussian on
-the detector face. With a library (see Profile3DIBIXFitter in
+3D profile fitting, for profile_3d_ibix and profile_3d_ic: a ToF line shape
+(LineShape, tof_line_shape.h: iBIX or Ikeda-Carpenter) times a bivariate
+Gaussian on the detector face. With a library (see Profile3DFitter in
 tof_integration.h) the shape is measured only where the counts determine it
-and reused elsewhere, as profile_1d_ibix does for the line shape alone (after
+and reused elsewhere, as the 1D methods do for the line shape alone (after
 Mantid's IntegratePeaksProfileFitting).
 
-Model, for a peak whose line shape has its centroid at time t0 and whose centre
+Model, for iBIX, for a peak whose line shape has its centroid at time t0 and
+whose centre
 on the detector at that time is (x0, y0):
 
   m(x, y, t) = A ibix(t; alpha, beta, sigma, T_ph) bvg(x - xc(t), y - yc(t))
@@ -43,7 +45,7 @@ Two fits:
 
 Choices that differ from the 3D fit this replaced:
 
-  - ToF in us rather than in frames, as profile_1d_ibix, so a library
+  - ToF in us rather than in frames, as the 1D methods, so a library
     entry carries the same line shape across reflections whose ToF bins
     differ in width.
   - The peak position on the detector is a parameter rather than the brightest
@@ -65,7 +67,7 @@ Choices that differ from the 3D fit this replaced:
 
 namespace dials { namespace algorithms {
 
-  struct TOFProfile3DIBIXParams {
+  struct TOFProfile3DParams {
     /*
      * The line shape fitted, its starting values and bounds, in the order of
      * LineShape::p. iBIX: alpha and beta (1/us); sigma is taken from the data.
@@ -100,25 +102,25 @@ namespace dials { namespace algorithms {
     // passes); without, every reflection is fitted freely on its own
     bool build_library = true;
 
-    TOFProfile3DIBIXParams(double alpha_,
-                           double alpha_min_,
-                           double alpha_max_,
-                           double beta_,
-                           double beta_min_,
-                           double beta_max_,
-                           double SigX_min_,
-                           double SigX_max_,
-                           double SigY_min_,
-                           double SigY_max_,
-                           double SigP_min_,
-                           double SigP_max_,
-                           double max_drift_factor_,
-                           int n_restarts_,
-                           bool show_profile_failures_,
-                           double library_min_i_sigma_,
-                           double library_min_corr_,
-                           double position_tolerance_,
-                           double free_position_min_i_sigma_)
+    TOFProfile3DParams(double alpha_,
+                       double alpha_min_,
+                       double alpha_max_,
+                       double beta_,
+                       double beta_min_,
+                       double beta_max_,
+                       double SigX_min_,
+                       double SigX_max_,
+                       double SigY_min_,
+                       double SigY_max_,
+                       double SigP_min_,
+                       double SigP_max_,
+                       double max_drift_factor_,
+                       int n_restarts_,
+                       bool show_profile_failures_,
+                       double library_min_i_sigma_,
+                       double library_min_corr_,
+                       double position_tolerance_,
+                       double free_position_min_i_sigma_)
         : SigX_min(SigX_min_),
           SigX_max(SigX_max_),
           SigY_min(SigY_min_),
@@ -205,7 +207,7 @@ namespace dials { namespace algorithms {
     std::vector<double> profile;  // unit sum over the box
   };
 
-  namespace profile_3d_ibix_detail {
+  namespace profile_3d_detail {
 
     // Expected raw counts per voxel below which a variance is not allowed to
     // fall, so that a voxel the model says is empty keeps a finite weight
@@ -574,7 +576,7 @@ namespace dials { namespace algorithms {
     };
 
     inline bool seed_shape(const Profile3DData& d,
-                           const TOFProfile3DIBIXParams& params,
+                           const TOFProfile3DParams& params,
                            ShapeSeed& seed,
                            Parameterisation& parameterisation) {
       // ToF projection of the positive part
@@ -758,7 +760,7 @@ namespace dials { namespace algorithms {
       return v <= lo + margin || v >= hi - margin;
     }
 
-  }  // namespace profile_3d_ibix_detail
+  }  // namespace profile_3d_detail
 
   /*
    * Fit every parameter of the model to one reflection, for the library.
@@ -768,7 +770,7 @@ namespace dials { namespace algorithms {
    * amplitude is positive, and neither width on the detector nor the
    * correlation between them has run to a bound.
    */
-  namespace profile_3d_ibix_detail {
+  namespace profile_3d_detail {
 
     /*
      * Model (intensity times profile) against data over every usable voxel of
@@ -816,16 +818,15 @@ namespace dials { namespace algorithms {
       }
     }
 
-  }  // namespace profile_3d_ibix_detail
+  }  // namespace profile_3d_detail
 
-  inline Profile3DFitResult fit_profile_3d_ibix_shape(
-    const Profile3DData& d,
-    const TOFProfile3DIBIXParams& params,
-    double min_correlation,
-    int n_reweight = 2,
-    double box_min_correlation = 0.0,
-    double peak_height_fraction = 0.0) {
-    namespace detail = profile_3d_ibix_detail;
+  inline Profile3DFitResult fit_profile_3d_shape(const Profile3DData& d,
+                                                 const TOFProfile3DParams& params,
+                                                 double min_correlation,
+                                                 int n_reweight = 2,
+                                                 double box_min_correlation = 0.0,
+                                                 double peak_height_fraction = 0.0) {
+    namespace detail = profile_3d_detail;
     Profile3DFitResult best;
     if (!d.consistent() || d.nx < 3 || d.ny < 3 || d.nz < 5) {
       return best;
@@ -894,7 +895,7 @@ namespace dials { namespace algorithms {
       }
     }
     if (params.show_profile_failures) {
-      std::cerr << "profile_3d_ibix shape fit failure: " << why << "\n";
+      std::cerr << "3D profile shape fit failure: " << why << "\n";
     }
     return best;
   }
@@ -908,13 +909,13 @@ namespace dials { namespace algorithms {
    * on the detector and at the brightest ToF slice, and may go anywhere in the
    * box.
    */
-  inline Profile3DFitResult fit_profile_3d_ibix_forced(
+  inline Profile3DFitResult fit_profile_3d_forced(
     const Profile3DData& d,
     const Profile3DShape& shape,
     const Profile3DPosition* seed = nullptr,
     const Profile3DPosition* tolerance = nullptr,
     int n_reweight = 3) {
-    namespace detail = profile_3d_ibix_detail;
+    namespace detail = profile_3d_detail;
     Profile3DFitResult result;
     if (!d.consistent() || !shape.valid || d.nz < 2) {
       return result;
@@ -1014,11 +1015,11 @@ namespace dials { namespace algorithms {
    * place, with the shape broadened by how uncertain that place is (see
    * broaden_profile_3d_shape), the fit is unbiased on average.
    */
-  inline Profile3DFitResult fit_profile_3d_ibix_fixed(const Profile3DData& d,
-                                                      const Profile3DShape& shape,
-                                                      const Profile3DPosition& position,
-                                                      int n_reweight = 3) {
-    namespace detail = profile_3d_ibix_detail;
+  inline Profile3DFitResult fit_profile_3d_fixed(const Profile3DData& d,
+                                                 const Profile3DShape& shape,
+                                                 const Profile3DPosition& position,
+                                                 int n_reweight = 3) {
+    namespace detail = profile_3d_detail;
     Profile3DFitResult result;
     if (!d.consistent() || !shape.valid) {
       return result;
@@ -1044,4 +1045,4 @@ namespace dials { namespace algorithms {
 
 }}  // namespace dials::algorithms
 
-#endif  // DIALS_ALGORITHMS_INTEGRATION_TOF_PROFILE_3D_IBIX_H
+#endif  // DIALS_ALGORITHMS_INTEGRATION_TOF_PROFILE_3D_H
