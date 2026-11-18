@@ -32,9 +32,9 @@ from dials.util.options import ArgumentParser, reflections_and_experiments_from_
 from dials.util.phil import parse
 from dials.util.version import dials_version
 from dials_algorithms_tof_integration_ext import (
-    TOFProfile1DIBIXParams,
+    TOFProfile1DParams,
     TOFProfile3DGutmannParams,
-    TOFProfile3DIBIXParams,
+    TOFProfile3DParams,
     integrate_reflection_table,
     tof_assign_overlap_ownership,
     tof_calculate_ellipse_shoebox_mask,
@@ -923,13 +923,14 @@ def ic_line_shape(p: libtbx.phil.scope_extract) -> dict:
     }
 
 
-def make_profile_1d_ibix_params(
+def make_profile_1d_params(
     params: libtbx.phil.scope_extract, show_profile_failures: bool
 ) -> object:
     """
-    The fitter parameters for profile_1d_ibix, or for the deprecated
-    profile_1d_profilelib: profile_1d_ibix with the library built, and the
-    parameters of its own scope, which are the values recommended for MANDI.
+    The fitter parameters for profile_1d_ibix and profile_1d_ic, and for the
+    deprecated profile_1d_profilelib: profile_1d_ibix with the library built,
+    and the parameters of its own scope, which are the values recommended for
+    MANDI.
     """
     if params.method == "profile_1d_ic":
         p = params.profile_1d_ic
@@ -941,7 +942,7 @@ def make_profile_1d_ibix_params(
                 f"{p.library.min_i_sigma} whose fit correlates >= "
                 f"{p.library.min_correlation}, then holding them fixed elsewhere"
             )
-        return TOFProfile1DIBIXParams(
+        return TOFProfile1DParams(
             {
                 # The amplitude, here, and A in the line shape the decay
                 "A_min": 1e-6,
@@ -996,7 +997,7 @@ def make_profile_1d_ibix_params(
             f"{p.library.min_correlation}, then holding them fixed elsewhere"
         )
     # dict needed due to boost limit of 15 template arguments
-    return TOFProfile1DIBIXParams(
+    return TOFProfile1DParams(
         {
             "A_min": p.min_A,
             "A_max": p.max_A,
@@ -1020,13 +1021,14 @@ def make_profile_1d_ibix_params(
     )
 
 
-def make_profile_3d_ibix_params(
+def make_profile_3d_params(
     params: libtbx.phil.scope_extract, show_profile_failures: bool
 ) -> object:
     """
-    The fitter parameters for profile_3d_ibix, or for the deprecated
-    profile_3d_profilelib: profile_3d_ibix with the library built, and the
-    parameters of its own scope, which are the values recommended for MANDI.
+    The fitter parameters for profile_3d_ibix and profile_3d_ic, and for the
+    deprecated profile_3d_profilelib: profile_3d_ibix with the library built,
+    and the parameters of its own scope, which are the values recommended for
+    MANDI.
     """
     if params.method == "profile_3d_ic":
         p = params.profile_3d_ic
@@ -1040,7 +1042,7 @@ def make_profile_3d_ibix_params(
                 f"{p.library.min_i_sigma} whose fit correlates >= "
                 f"{p.library.min_correlation}, then holding them fixed elsewhere"
             )
-        return TOFProfile3DIBIXParams(
+        return TOFProfile3DParams(
             {
                 "alpha": 0.0,
                 "alpha_min": 0.0,
@@ -1103,7 +1105,7 @@ def make_profile_3d_ibix_params(
             f"{p.library.min_correlation}, then holding them fixed elsewhere"
         )
     # dict needed due to boost limit of 15 template arguments
-    return TOFProfile3DIBIXParams(
+    return TOFProfile3DParams(
         {
             "alpha": p.init_alpha,
             "alpha_min": p.min_alpha,
@@ -1144,21 +1146,17 @@ def integrate_reflection_table_for_experiment(
     used, which holds any profile library it built, or None for summation.
     """
     apply_lorentz = params.corrections.lorentz
-    profile_1d_ibix_params = None
+    profile_1d_params = None
     profile_3d_gutmann_params = None
-    profile_3d_ibix_params = None
+    profile_3d_params = None
 
     logger.info(f"    Integrating using {params.method}")
 
     show_profile_failures = logger.getEffectiveLevel() == logging.DEBUG
     if params.method in ("profile_1d_ibix", "profile_1d_profilelib"):
-        profile_1d_ibix_params = make_profile_1d_ibix_params(
-            params, show_profile_failures
-        )
+        profile_1d_params = make_profile_1d_params(params, show_profile_failures)
     elif params.method == "profile_1d_ic":
-        profile_1d_ibix_params = make_profile_1d_ibix_params(
-            params, show_profile_failures
-        )
+        profile_1d_params = make_profile_1d_params(params, show_profile_failures)
     elif params.method == "profile_3d_gutmann":
         alpha = params.profile_3d_gutmann.init_alpha
         beta = params.profile_3d_gutmann.init_beta
@@ -1183,13 +1181,9 @@ def integrate_reflection_table_for_experiment(
             show_profile_failures,
         )
     elif params.method == "profile_3d_ic":
-        profile_3d_ibix_params = make_profile_3d_ibix_params(
-            params, show_profile_failures
-        )
+        profile_3d_params = make_profile_3d_params(params, show_profile_failures)
     elif params.method in ("profile_3d_ibix", "profile_3d_profilelib"):
-        profile_3d_ibix_params = make_profile_3d_ibix_params(
-            params, show_profile_failures
-        )
+        profile_3d_params = make_profile_3d_params(params, show_profile_failures)
 
     if apply_lorentz:
         logger.info("    Adding Lorentz correction")
@@ -1208,9 +1202,9 @@ def integrate_reflection_table_for_experiment(
         absorption_params,
         apply_lorentz,
         params.mp.nproc,
-        profile_1d_ibix_params,
+        profile_1d_params,
         profile_3d_gutmann_params,
-        profile_3d_ibix_params,
+        profile_3d_params,
         params.corrections.lorentz_wavelength_power,
     )
 

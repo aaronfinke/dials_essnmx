@@ -17,9 +17,9 @@
 #include <scitbx/vec3.h>
 #include <scitbx/constants.h>
 #include <dials/model/data/mask_code.h>
-#include <dials/algorithms/integration/tof/tof_profile_1d_ibix.h>
+#include <dials/algorithms/integration/tof/tof_profile_1d.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_gutmann.h>
-#include <dials/algorithms/integration/tof/tof_profile_3d_ibix.h>
+#include <dials/algorithms/integration/tof/tof_profile_3d.h>
 #include <dials/algorithms/integration/tof/tof_peak_shape.h>
 #include <dials/algorithms/integration/tof/tof_profile_library.h>
 #include <dials/algorithms/scaling/tof/tof_scaling.h>
@@ -397,7 +397,7 @@ namespace dials { namespace algorithms {
 
     /*
      * For fits that weight each voxel by the counts their model expects
-     * there (profile_3d_ibix), indexed as intensity_3d: the corrected
+     * there (the 3D methods), indexed as intensity_3d: the corrected
      * value of one raw count (0 where the voxel is not valid or could not be
      * corrected), the background in raw counts, and the variance from the
      * incident and empty spectra. n_background is the number of pixels the
@@ -498,7 +498,7 @@ namespace dials { namespace algorithms {
           result.intensity_3d(x, y, z) = overlapped ? 0.0 : pixel.I;
           result.background_var_3d(x, y, z) =
             overlapped ? overlapped_voxel_variance : pixel.var_B;
-          // A gain of 0 keeps the voxel out of profile_3d_ibix's fits
+          // A gain of 0 keeps the voxel out of the 3D methods' fits
           if ((mask & Valid) == Valid && !overlapped) {
             result.gain_3d(x, y, z) = pixel.gain;
           }
@@ -539,8 +539,8 @@ namespace dials { namespace algorithms {
   };
 
   /*
-   * The voxels of a shoebox as profile_3d_ibix fits them (see
-   * tof_profile_3d_ibix.h).
+   * The voxels of a shoebox as the 3D methods fit them (see
+   * tof_profile_3d.h).
    */
   inline Profile3DData profile_3d_data(const ShoeboxIntegrationResult& r) {
     Profile3DData d;
@@ -904,9 +904,9 @@ namespace dials { namespace algorithms {
    * are enough counts to determine it, store it against where it was measured,
    * then hold it fixed and fit only the amplitude and position everywhere else.
    *
-   * The peak shape is the same back-to-back exponential profile_1d_ibix fits,
-   * so the two share their model and their fitting machinery; what differs is
-   * that a weak reflection is never asked to determine its own shape.
+   * profile_1d_ibix and profile_1d_ic (the line shape is in the parameters).
+   * Without a library every reflection is fitted freely on its own; with one,
+   * a weak reflection is never asked to determine its own shape.
    *
    * library_min_corr is the correlation a free fit must reach for its shape to
    * enter the library.  It is deliberately looser than the threshold used to
@@ -914,7 +914,7 @@ namespace dials { namespace algorithms {
    * by almost any smooth curve over the seven points of a coarse projection
    * while being close to unreachable over fifty fine ones.
    */
-  class Profile1DIBIXFitter : public ProfileFitter {
+  class Profile1DFitter : public ProfileFitter {
   public:
     // A library entry: the line shape in ToF, and where the detector face
     // could be measured too (has_offset), its shape there
@@ -926,7 +926,7 @@ namespace dials { namespace algorithms {
     };
     using Library = ProfileLibrary<Shape>;
 
-    explicit Profile1DIBIXFitter(TOFProfile1DIBIXParams params)
+    explicit Profile1DFitter(TOFProfile1DParams params)
         : params_(params),
           min_i_sigma_(params.library_min_i_sigma),
           min_corr_(params.library_min_corr) {}
@@ -950,19 +950,18 @@ namespace dials { namespace algorithms {
         return;
       }
 
-      TOFProfile1DIBIXParams local = params_;  // the fit mutates nothing shared
-      local.trust_min_corr = min_corr_;        // see Profile1DIBIXFitter
+      TOFProfile1DParams local = params_;  // the fit mutates nothing shared
+      local.trust_min_corr = min_corr_;    // see Profile1DFitter
       double I_prf = 0.0;
       ProfileLine shape;
       scitbx::af::shared<double> line_profile(shoebox_result.tof_z.size(), 0.0);
-      bool ok =
-        fit_profile_1d_ibix_shape(shoebox_result.projected_intensity.const_ref(),
-                                  shoebox_result.tof_z.const_ref(),
-                                  local,
-                                  I_prf,
-                                  line_profile,
-                                  false,
-                                  &shape);
+      bool ok = fit_profile_1d_shape(shoebox_result.projected_intensity.const_ref(),
+                                     shoebox_result.tof_z.const_ref(),
+                                     local,
+                                     I_prf,
+                                     line_profile,
+                                     false,
+                                     &shape);
       if (!ok || !shape.valid) {
         return;
       }
@@ -1010,14 +1009,13 @@ namespace dials { namespace algorithms {
       }
       std::size_t n = shoebox_result.projected_intensity.size();
       scitbx::af::shared<double> model(n, 0.0);
-      bool ok =
-        fit_profile_1d_ibix_forced(shoebox_result.projected_intensity.const_ref(),
-                                   shoebox_result.tof_z.const_ref(),
-                                   entry->shape.line,
-                                   params_.A_min,
-                                   params_.A_max,
-                                   I_prf,
-                                   model);
+      bool ok = fit_profile_1d_forced(shoebox_result.projected_intensity.const_ref(),
+                                      shoebox_result.tof_z.const_ref(),
+                                      entry->shape.line,
+                                      params_.A_min,
+                                      params_.A_max,
+                                      I_prf,
+                                      model);
       if (!ok) {
         return false;
       }
@@ -1033,11 +1031,11 @@ namespace dials { namespace algorithms {
              double& I_prf,
              double& var_prf) override {
       var_prf = shoebox_result.variance;
-      TOFProfile1DIBIXParams local = params_;
-      return fit_profile_1d_ibix_shape(shoebox_result.projected_intensity.const_ref(),
-                                       shoebox_result.tof_z.const_ref(),
-                                       local,
-                                       I_prf);
+      TOFProfile1DParams local = params_;
+      return fit_profile_1d_shape(shoebox_result.projected_intensity.const_ref(),
+                                  shoebox_result.tof_z.const_ref(),
+                                  local,
+                                  I_prf);
     }
 
     std::size_t library_size() const override {
@@ -1127,7 +1125,7 @@ namespace dials { namespace algorithms {
       return it != face_by_panel_.end() ? it->second : global_face_;
     }
 
-    TOFProfile1DIBIXParams params_;
+    TOFProfile1DParams params_;
     double min_i_sigma_;
     double min_corr_;
     Library library_;
@@ -1138,9 +1136,9 @@ namespace dials { namespace algorithms {
   };
 
   /*
-   * profile_3d_ibix (see tof_profile_3d_ibix.h for the model and the fits).
-   * Without a library every reflection is fitted freely on its own. With
-   * one, as profile_1d_ibix does for the line shape alone:
+   * profile_3d_ibix and profile_3d_ic (see tof_profile_3d.h for the model and
+   * the fits). Without a library every reflection is fitted freely on its own.
+   * With one, as the 1D methods do for the line shape alone:
    *
    * Pass one fits every parameter to the reflections strong enough to
    * determine them and keeps each shape against where it was measured, with
@@ -1163,11 +1161,11 @@ namespace dials { namespace algorithms {
    * Without predictions every reflection is fitted with its position free
    * anywhere in the box.
    */
-  class Profile3DIBIXFitter : public ProfileFitter {
+  class Profile3DFitter : public ProfileFitter {
   public:
     using Library = ProfileLibrary<Profile3DShape>;
 
-    explicit Profile3DIBIXFitter(TOFProfile3DIBIXParams params) : params_(params) {}
+    explicit Profile3DFitter(TOFProfile3DParams params) : params_(params) {}
 
     bool needs_two_passes() const override {
       return params_.build_library;
@@ -1185,7 +1183,7 @@ namespace dials { namespace algorithms {
       if (!(i_sigma >= params_.library_min_i_sigma)) {
         return;
       }
-      Profile3DFitResult fit = fit_profile_3d_ibix_shape(
+      Profile3DFitResult fit = fit_profile_3d_shape(
         profile_3d_data(shoebox_result), params_, params_.library_min_corr);
       if (!fit.success || !fit.shape.valid) {
         return;
@@ -1239,7 +1237,7 @@ namespace dials { namespace algorithms {
 
         // At the expected position, with the shape broadened by how
         // uncertain that position is
-        result = fit_profile_3d_ibix_fixed(
+        result = fit_profile_3d_fixed(
           d, broaden_profile_3d_shape(entry->shape, scatter), seed);
 
         // Where that finds a peak strong enough to place, place it
@@ -1252,14 +1250,14 @@ namespace dials { namespace algorithms {
           tolerance.y = std::max(params_.position_tolerance * scatter.y, 1.0);
           tolerance.t = std::max(params_.position_tolerance * scatter.t, mean_dt);
           Profile3DFitResult placed =
-            fit_profile_3d_ibix_forced(d, entry->shape, &seed, &tolerance);
+            fit_profile_3d_forced(d, entry->shape, &seed, &tolerance);
           if (placed.success) {
             result = placed;
           }
         }
       } else {
         // No prediction to start from: the position comes from the data
-        result = fit_profile_3d_ibix_forced(d, entry->shape);
+        result = fit_profile_3d_forced(d, entry->shape);
       }
       if (!result.success) {
         return false;
@@ -1275,12 +1273,12 @@ namespace dials { namespace algorithms {
              double& var_prf) override {
       var_prf = shoebox_result.variance;
       Profile3DFitResult result =
-        fit_profile_3d_ibix_shape(profile_3d_data(shoebox_result),
-                                  params_,
-                                  params_.min_corr,
-                                  2,
-                                  params_.free_fit_box_min_corr,
-                                  params_.free_fit_peak_height_fraction);
+        fit_profile_3d_shape(profile_3d_data(shoebox_result),
+                             params_,
+                             params_.min_corr,
+                             2,
+                             params_.free_fit_box_min_corr,
+                             params_.free_fit_peak_height_fraction);
       if (!result.success) {
         return false;
       }
@@ -1327,7 +1325,7 @@ namespace dials { namespace algorithms {
     }
 
   private:
-    TOFProfile3DIBIXParams params_;
+    TOFProfile3DParams params_;
     Library library_;
   };
 
@@ -1781,7 +1779,7 @@ namespace dials { namespace algorithms {
     scitbx::af::shared<double> tof_z_out,
     scitbx::af::shared<double> line_profile_out,
     const bool& apply_lorentz_correction,
-    TOFProfile1DIBIXParams& profile_params_1d_ibix,
+    TOFProfile1DParams& profile_params_1d,
     double lorentz_wavelength_power = 4.0) {
     boost::python::tuple result =
       calculate_line_profile_for_reflection(reflection,
@@ -1804,12 +1802,12 @@ namespace dials { namespace algorithms {
     bool profile_success = false;
 
     if (success) {
-      TOFProfile1DIBIXParams local = profile_params_1d_ibix;
-      profile_success = fit_profile_1d_ibix_shape(projected_intensity_out.const_ref(),
-                                                  tof_z_out.const_ref(),
-                                                  local,
-                                                  I_prf,
-                                                  line_profile_out);
+      TOFProfile1DParams local = profile_params_1d;
+      profile_success = fit_profile_1d_shape(projected_intensity_out.const_ref(),
+                                             tof_z_out.const_ref(),
+                                             local,
+                                             I_prf,
+                                             line_profile_out);
     }
     return boost::python::make_tuple(I_prf, var_prf, I_sum, var_sum, profile_success);
   }
@@ -1909,9 +1907,9 @@ namespace dials { namespace algorithms {
                                      profile_3d_out);
   }
 
-  // As calculate_line_profile_for_reflection_3d, but fits a 3D
-  // iBIX profile instead of a Gutmann or Ikeda-Carpenter profile: the
-  // reflection on its own, as profile_3d_ibix does without a library.
+  // As calculate_line_profile_for_reflection_3d, but fits the 3D model of
+  // profile_3d_ibix or profile_3d_ic (from the parameters) instead of a
+  // Gutmann profile: the reflection on its own, as without a library.
   inline boost::python::tuple calculate_line_profile_for_reflection_3d(
     dials::af::reflection_table& reflection,
     Experiment& experiment,
@@ -1923,7 +1921,7 @@ namespace dials { namespace algorithms {
     scitbx::af::shared<double> projected_background_out,
     scitbx::af::shared<double> tof_z_out,
     const bool& apply_lorentz_correction,
-    TOFProfile3DIBIXParams& profile_params_3d_ibix,
+    TOFProfile3DParams& profile_params_3d,
     double lorentz_wavelength_power = 4.0) {
     DIALS_ASSERT(reflection.size() == 1);
 
@@ -1988,14 +1986,13 @@ namespace dials { namespace algorithms {
       result.intensity_3d.accessor());
 
     if (result.success) {
-      const TOFProfile3DIBIXParams& p = profile_params_3d_ibix;
-      Profile3DFitResult fit =
-        fit_profile_3d_ibix_shape(profile_3d_data(result),
-                                  p,
-                                  p.min_corr,
-                                  2,
-                                  p.free_fit_box_min_corr,
-                                  p.free_fit_peak_height_fraction);
+      const TOFProfile3DParams& p = profile_params_3d;
+      Profile3DFitResult fit = fit_profile_3d_shape(profile_3d_data(result),
+                                                    p,
+                                                    p.min_corr,
+                                                    2,
+                                                    p.free_fit_box_min_corr,
+                                                    p.free_fit_peak_height_fraction);
       profile_success = fit.success;
       if (fit.success) {
         I_prf = fit.intensity;

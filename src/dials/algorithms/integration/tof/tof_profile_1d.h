@@ -1,5 +1,5 @@
-#ifndef DIALS_ALGORITHMS_INTEGRATION_TOF_TOF_PROFILE_1D_IBIX_H
-#define DIALS_ALGORITHMS_INTEGRATION_TOF_TOF_PROFILE_1D_IBIX_H
+#ifndef DIALS_ALGORITHMS_INTEGRATION_TOF_TOF_PROFILE_1D_H
+#define DIALS_ALGORITHMS_INTEGRATION_TOF_TOF_PROFILE_1D_H
 
 #include <algorithm>
 #include <cmath>
@@ -16,17 +16,17 @@
 #include <eigen3/unsupported/Eigen/NonLinearOptimization>
 
 /*
-1D profile fitting method based on
+1D profile fitting: a ToF line shape (LineShape, tof_line_shape.h: iBIX or
+Ikeda-Carpenter) fitted to the ToF projection of a reflection, for
+profile_1d_ibix and profile_1d_ic. The fitting follows
 Yano, N., Yamada, T., Hosoya, T. et al.
 Application of profile fitting method to neutron time-of-flight protein
 single crystal diffraction data collected at the iBIX. Sci Rep 6,
 36628 (2016). https://doi.org/10.1038/srep36628
-
-profile_1d_ibix fits the back-to-back exponential line shape to the ToF
-projection of a reflection. Parameter bounds are imposed by reparameterisation
+ Parameter bounds are imposed by reparameterisation
 rather than by clamping, and the acceptance tests take a time tolerance and a
 smoothed peak height where the slices are fine (a fixed three bins and the
-tallest channel otherwise). With a library (see Profile1DIBIXFitter in
+tallest channel otherwise). With a library (see Profile1DFitter in
 tof_integration.h), the shape is measured only where the counts determine it
 and reused elsewhere, after Mantid's IntegratePeaksProfileFitting.
 */
@@ -35,7 +35,7 @@ namespace dials { namespace algorithms {
 
   /*
    * A peak shape, as fitted on one reflection and reusable on another.  Held
-   * separately from TOFProfile1DIBIXParams so that a library can be built
+   * separately from TOFProfile1DParams so that a library can be built
    * from many reflections without mutating shared fitting parameters.
    */
   struct ProfileLine {
@@ -45,11 +45,11 @@ namespace dials { namespace algorithms {
   };
 
   /*
-   * Everything profile_1d_ibix needs: the shape fit, the acceptance thresholds,
+   * Everything a 1D method needs: the shape fit, the acceptance thresholds,
    * and whether to build a library and which reflections may contribute a
    * shape to it.
    */
-  struct TOFProfile1DIBIXParams {
+  struct TOFProfile1DParams {
     double A;
     double A_min;
     double A_max;
@@ -78,23 +78,23 @@ namespace dials { namespace algorithms {
     // passes); without, every reflection is fitted freely on its own
     bool build_library = true;
 
-    TOFProfile1DIBIXParams(double A_min,
-                           double A_max,
-                           double alpha,
-                           double alpha_min,
-                           double alpha_max,
-                           double beta,
-                           double beta_min,
-                           double beta_max,
-                           int n_restarts,
-                           bool optimize_profile,
-                           bool show_profile_failures,
-                           double peak_height_smoothing,
-                           double trust_min_corr,
-                           double trust_peak_tolerance,
-                           double trust_peak_height_fraction,
-                           double library_min_i_sigma,
-                           double library_min_corr)
+    TOFProfile1DParams(double A_min,
+                       double A_max,
+                       double alpha,
+                       double alpha_min,
+                       double alpha_max,
+                       double beta,
+                       double beta_min,
+                       double beta_max,
+                       int n_restarts,
+                       bool optimize_profile,
+                       bool show_profile_failures,
+                       double peak_height_smoothing,
+                       double trust_min_corr,
+                       double trust_peak_tolerance,
+                       double trust_peak_height_fraction,
+                       double library_min_i_sigma,
+                       double library_min_corr)
         : A(A_min),
           A_min(A_min),
           A_max(A_max),
@@ -182,7 +182,7 @@ namespace dials { namespace algorithms {
     return lo + span * frac;
   }
 
-  struct IBIXShapeFunctor {
+  struct LineShapeFunctor {
     scitbx::af::const_ref<double> tof;
     scitbx::af::const_ref<double> y_norm;  // Assumed normalized
     LineShape::Kind kind;
@@ -191,7 +191,7 @@ namespace dials { namespace algorithms {
     std::vector<double> max_bounds;
     int num_data_points, num_params;
 
-    IBIXShapeFunctor(scitbx::af::const_ref<double> tof_,
+    LineShapeFunctor(scitbx::af::const_ref<double> tof_,
                      scitbx::af::const_ref<double> y_norm_,
                      LineShape::Kind kind_,
                      const std::vector<double>& minb,
@@ -267,14 +267,14 @@ namespace dials { namespace algorithms {
   };
 
   /*
-   * As IBIXShapeFunctor, but with the peak shape held fixed and only the
+   * As LineShapeFunctor, but with the peak shape held fixed and only the
    * amplitude and the peak position free.  Used when the shape comes from a
    * profile library built on strong reflections, as in Mantid's
    * BVGFitTools.doBVGFit with forceParams: a weak reflection has too few
    * counts to determine its own shape, but two parameters against the same
    * number of points are well constrained.
    */
-  struct IBIXForcedFunctor {
+  struct LineForcedFunctor {
     scitbx::af::const_ref<double> tof;
     scitbx::af::const_ref<double> y_norm;  // Assumed normalized
     LineShape line;                        // fixed shape
@@ -282,7 +282,7 @@ namespace dials { namespace algorithms {
     std::array<double, 2> max_bounds;
     int num_data_points, num_params;
 
-    IBIXForcedFunctor(scitbx::af::const_ref<double> tof_,
+    LineForcedFunctor(scitbx::af::const_ref<double> tof_,
                       scitbx::af::const_ref<double> y_norm_,
                       const LineShape& line_,
                       const std::array<double, 2>& minb,
@@ -345,7 +345,7 @@ namespace dials { namespace algorithms {
     }
   };
 
-  class TOFProfile1DIBIX {
+  class TOFProfile1DFit {
   public:
     scitbx::af::const_ref<double> tof;
     scitbx::af::const_ref<double> intensities;  // raw intensities
@@ -366,23 +366,23 @@ namespace dials { namespace algorithms {
     std::vector<double> max_bounds;
 
     /*
-     * line_init, line_min and line_max as in TOFProfile1DIBIXParams: for
+     * line_init, line_min and line_max as in TOFProfile1DParams: for
      * iBIX sigma is taken from the data, for Ikeda-Carpenter the convolution
      * widths are in slices. T_ph_ is the time of the data's peak.
      */
-    TOFProfile1DIBIX(scitbx::af::const_ref<double> tof_,
-                     scitbx::af::const_ref<double> intensities_,
-                     double A_,
-                     const LineShape& line_init,
-                     const LineShape& line_min,
-                     const LineShape& line_max,
-                     double T_ph_,
-                     const std::array<double, 2> A_bounds,
-                     int n_restarts_,
-                     double peak_height_smoothing_,
-                     double trust_min_corr_,
-                     double trust_peak_tolerance_,
-                     double trust_peak_height_fraction_)
+    TOFProfile1DFit(scitbx::af::const_ref<double> tof_,
+                    scitbx::af::const_ref<double> intensities_,
+                    double A_,
+                    const LineShape& line_init,
+                    const LineShape& line_min,
+                    const LineShape& line_max,
+                    double T_ph_,
+                    const std::array<double, 2> A_bounds,
+                    int n_restarts_,
+                    double peak_height_smoothing_,
+                    double trust_min_corr_,
+                    double trust_peak_tolerance_,
+                    double trust_peak_height_fraction_)
         : tof(tof_),
           intensities(intensities_),
           A(A_),
@@ -591,11 +591,11 @@ namespace dials { namespace algorithms {
       const int ndata = static_cast<int>(tof.size());
       if (ndata < 5) return false;
 
-      IBIXShapeFunctor functor(
+      LineShapeFunctor functor(
         tof, y_norm.const_ref(), line.kind, min_bounds, max_bounds);
       const int n_line = line.n_params();
       const int n_par = n_line + 2;
-      typedef Eigen::LevenbergMarquardt<IBIXShapeFunctor, double> LM;
+      typedef Eigen::LevenbergMarquardt<LineShapeFunctor, double> LM;
 
       auto run_single_fit = [&](const Eigen::VectorXd& x_init,
                                 double& final_error) -> bool {
@@ -800,10 +800,10 @@ namespace dials { namespace algorithms {
     }
   };
 
-  bool fit_profile_1d_ibix_shape(
+  bool fit_profile_1d_shape(
     scitbx::af::const_ref<double> projected_intensity,
     scitbx::af::const_ref<double> tof_z,
-    TOFProfile1DIBIXParams& profile_params,
+    TOFProfile1DParams& profile_params,
     double& I_prf_out,
     boost::optional<scitbx::af::shared<double>> line_profile_out = boost::none,
     bool update_params = false,
@@ -828,19 +828,19 @@ namespace dials { namespace algorithms {
     line_min.p = profile_params.line_min;
     line_max.p = profile_params.line_max;
 
-    TOFProfile1DIBIX profile(tof_z,
-                             projected_intensity,
-                             profile_params.A,
-                             line_init,
-                             line_min,
-                             line_max,
-                             T_ph,
-                             A_bounds,
-                             profile_params.n_restarts,
-                             profile_params.peak_height_smoothing,
-                             profile_params.trust_min_corr,
-                             profile_params.trust_peak_tolerance,
-                             profile_params.trust_peak_height_fraction);
+    TOFProfile1DFit profile(tof_z,
+                            projected_intensity,
+                            profile_params.A,
+                            line_init,
+                            line_min,
+                            line_max,
+                            T_ph,
+                            A_bounds,
+                            profile_params.n_restarts,
+                            profile_params.peak_height_smoothing,
+                            profile_params.trust_min_corr,
+                            profile_params.trust_peak_tolerance,
+                            profile_params.trust_peak_height_fraction);
 
     bool profile_success = true;
     if (profile_params.optimize_profile) {
@@ -885,7 +885,7 @@ namespace dials { namespace algorithms {
    * less closely, which lowers that correlation while raising the accuracy of
    * the intensity.  Gating on it would reject the better answer.
    */
-  bool fit_profile_1d_ibix_forced(
+  bool fit_profile_1d_forced(
     scitbx::af::const_ref<double> projected_intensity,
     scitbx::af::const_ref<double> tof_z,
     const ProfileLine& shape,
@@ -930,14 +930,14 @@ namespace dials { namespace algorithms {
     std::array<double, 2> min_bounds = {A_min, onset_min};
     std::array<double, 2> max_bounds = {A_max, tof_z.back()};
 
-    IBIXForcedFunctor functor(
+    LineForcedFunctor functor(
       tof_z, y_norm.const_ref(), shape.line, min_bounds, max_bounds);
 
     double A_seed = analytic_amplitude(tof_z, y_norm.const_ref(), shape.line, onset);
     Eigen::VectorXd x(2);
     x << std::min(std::max(A_seed, A_min), A_max), onset;
 
-    Eigen::LevenbergMarquardt<IBIXForcedFunctor, double> lm(functor);
+    Eigen::LevenbergMarquardt<LineForcedFunctor, double> lm(functor);
     lm.parameters.maxfev = 200;
     lm.parameters.xtol = 1e-8;
     lm.parameters.ftol = 1e-8;
@@ -978,4 +978,4 @@ namespace dials { namespace algorithms {
   }
 
 }}  // namespace dials::algorithms
-#endif /* DIALS_ALGORITHMS_INTEGRATION_TOF_TOF_PROFILE_1D_IBIX_H */
+#endif /* DIALS_ALGORITHMS_INTEGRATION_TOF_TOF_PROFILE_1D_H */

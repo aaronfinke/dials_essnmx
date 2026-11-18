@@ -5,7 +5,7 @@ import pytest
 
 from dials.array_family import flex
 from dials_algorithms_tof_integration_ext import (
-    TOFProfile3DIBIXParams,
+    TOFProfile3DParams,
     fit_profile_3d_ibix,
     profile_3d_ibix_profile,
 )
@@ -22,7 +22,7 @@ BACKGROUND = 2.0  # counts per voxel
 
 
 def make_params():
-    return TOFProfile3DIBIXParams(
+    return TOFProfile3DParams(
         {
             "alpha": 0.03,
             "alpha_min": 1e-5,
