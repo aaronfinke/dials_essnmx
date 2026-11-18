@@ -281,10 +281,13 @@ def test_mask_mode_keeps_overlapped_reflections(sxd_nacl):
 LIBRARY_METHODS = [
     ("method=profile_1d_ibix", "profile_1d_ibix.library.build=True"),
     ("method=profile_3d_ibix", "profile_3d_ibix.library.build=True"),
+    ("method=profile_1d_ic", "profile_1d_ic.library.build=True"),
+    ("method=profile_3d_ic", "profile_3d_ic.library.build=True"),
 ]
+LIBRARY_IDS = ["1d_ibix", "3d_ibix", "1d_ic", "3d_ic"]
 
 
-@pytest.mark.parametrize("method", LIBRARY_METHODS, ids=["1d", "3d"])
+@pytest.mark.parametrize("method", LIBRARY_METHODS, ids=LIBRARY_IDS)
 def test_deconvolve_mode(sxd_nacl, method):
     with pytest.raises(ValueError):
         integrate(sxd_nacl, "overlaps.mode=deconvolve", "method=summation")
@@ -322,7 +325,7 @@ def test_deconvolve_mode(sxd_nacl, method):
     )
 
 
-@pytest.mark.parametrize("method", LIBRARY_METHODS, ids=["1d", "3d"])
+@pytest.mark.parametrize("method", LIBRARY_METHODS, ids=LIBRARY_IDS)
 @pytest.mark.parametrize("mode", ["mask", "deconvolve"])
 def test_joint_estimator(sxd_nacl, mode, method):
     with pytest.raises(ValueError):

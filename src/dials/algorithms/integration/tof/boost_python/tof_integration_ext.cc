@@ -1,14 +1,13 @@
 
 #include <boost/python.hpp>
+#include <string>
 #include <boost/python/def.hpp>
 #include <dials/algorithms/integration/tof/tof_mask_calculator.h>
 #include <dials/algorithms/integration/tof/tof_integration.h>
 #include <dials/algorithms/integration/tof/tof_overlaps.h>
 #include <dials/algorithms/integration/tof/tof_overlap_deconvolution.h>
 #include <dials/algorithms/integration/tof/tof_profile_1d_ibix.h>
-#include <dials/algorithms/integration/tof/tof_profile_1d_ic.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_gutmann.h>
-#include <dials/algorithms/integration/tof/tof_profile_3d_ic.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_ibix.h>
 #include <dials/algorithms/scaling/tof/tof_scaling.h>
 
@@ -18,15 +17,12 @@ namespace dials { namespace algorithms { namespace boost_python {
 
   std::shared_ptr<ProfileFitter> make_profile_fitter(
     object profile_1d_ibix_params_obj,
-    object profile_1d_ic_params_obj,
     object profile_3d_gutmann_params_obj,
-    object profile_3d_ic_params_obj,
     object profile_3d_ibix_params_obj) {
     // Only one profile fitting method allowed
-    int n_given =
-      !profile_1d_ibix_params_obj.is_none() + !profile_1d_ic_params_obj.is_none()
-      + !profile_3d_gutmann_params_obj.is_none() + !profile_3d_ic_params_obj.is_none()
-      + !profile_3d_ibix_params_obj.is_none();
+    int n_given = !profile_1d_ibix_params_obj.is_none()
+                  + !profile_3d_gutmann_params_obj.is_none()
+                  + !profile_3d_ibix_params_obj.is_none();
     DIALS_ASSERT(n_given <= 1);
 
     if (!profile_1d_ibix_params_obj.is_none()) {
@@ -37,26 +33,39 @@ namespace dials { namespace algorithms { namespace boost_python {
       return std::make_shared<Profile3DIBIXFitter>(
         extract<TOFProfile3DIBIXParams>(profile_3d_ibix_params_obj)());
     }
-    if (!profile_1d_ic_params_obj.is_none()) {
-      return std::make_shared<Profile1DICFitter>(
-        extract<TOFProfile1DICParams>(profile_1d_ic_params_obj));
-    }
     if (!profile_3d_gutmann_params_obj.is_none()) {
       return std::make_shared<Profile3DGutmannFitter>(
         extract<TOFProfile3DGutmannParams>(profile_3d_gutmann_params_obj));
-    }
-    if (!profile_3d_ic_params_obj.is_none()) {
-      return std::make_shared<Profile3DICFitter>(
-        extract<TOFProfile3DICParams>(profile_3d_ic_params_obj));
     }
     return nullptr;
   }
 
   // boost::python::init<> and function-pointer signature deduction only
-  // support up to 15 arguments including the implicit self, so
-  // TOFProfile1DICParams (15 constructor arguments) and TOFProfile3DICParams
-  // (24 constructor arguments) are constructed from a single Python dict
-  // instead.
+  // support up to 15 arguments including the implicit self, so parameter
+  // structs with more constructor arguments are constructed from a single
+  // Python dict instead.
+
+  // An optional line shape in a parameter dict: "line_kind" ("ibix" or "ic")
+  // with "line_init", "line_min" and "line_max", five numbers each
+  template <typename Params>
+  void read_line_shape(dict params, Params& p) {
+    if (!params.has_key("line_kind")) {
+      return;
+    }
+    std::string kind = extract<std::string>(params["line_kind"]);
+    DIALS_ASSERT(kind == "ibix" || kind == "ic");
+    p.line_kind = kind == "ic" ? LineShape::IC : LineShape::IBIX;
+    const char* keys[3] = {"line_init", "line_min", "line_max"};
+    std::array<double, 5>* arrays[3] = {&p.line_init, &p.line_min, &p.line_max};
+    for (int k = 0; k < 3; ++k) {
+      boost::python::list values = extract<boost::python::list>(params[keys[k]]);
+      DIALS_ASSERT(boost::python::len(values) == 5);
+      for (int j = 0; j < 5; ++j) {
+        (*arrays[k])[j] = extract<double>(values[j]);
+      }
+    }
+  }
+
   std::shared_ptr<TOFProfile1DIBIXParams> make_TOFProfile1DIBIXParams(dict params) {
     auto d = [&](const char* key) { return extract<double>(params[key])(); };
     auto i = [&](const char* key) { return extract<int>(params[key])(); };
@@ -81,6 +90,7 @@ namespace dials { namespace algorithms { namespace boost_python {
     if (params.has_key("build_library")) {
       p->build_library = b("build_library");
     }
+    read_line_shape(params, *p);
     return p;
   }
 
@@ -118,55 +128,8 @@ namespace dials { namespace algorithms { namespace boost_python {
     if (params.has_key("build_library")) {
       p->build_library = b("build_library");
     }
+    read_line_shape(params, *p);
     return p;
-  }
-
-  std::shared_ptr<TOFProfile1DICParams> make_TOFProfile1DICParams(dict params) {
-    auto d = [&](const char* key) { return extract<double>(params[key])(); };
-    auto i = [&](const char* key) { return extract<int>(params[key])(); };
-    auto b = [&](const char* key) { return extract<bool>(params[key])(); };
-    return std::make_shared<TOFProfile1DICParams>(d("A"),
-                                                  d("A_min"),
-                                                  d("A_max"),
-                                                  d("B"),
-                                                  d("B_min"),
-                                                  d("B_max"),
-                                                  d("R"),
-                                                  d("R_min"),
-                                                  d("R_max"),
-                                                  d("HatWidth"),
-                                                  d("KConv"),
-                                                  i("n_restarts"),
-                                                  b("optimize_profile"),
-                                                  b("show_profile_failures"));
-  }
-
-  std::shared_ptr<TOFProfile3DICParams> make_TOFProfile3DICParams(dict params) {
-    auto d = [&](const char* key) { return extract<double>(params[key])(); };
-    auto i = [&](const char* key) { return extract<int>(params[key])(); };
-    auto b = [&](const char* key) { return extract<bool>(params[key])(); };
-    return std::make_shared<TOFProfile3DICParams>(d("A"),
-                                                  d("A_min"),
-                                                  d("A_max"),
-                                                  d("B"),
-                                                  d("B_min"),
-                                                  d("B_max"),
-                                                  d("R"),
-                                                  d("R_min"),
-                                                  d("R_max"),
-                                                  d("SigX_min"),
-                                                  d("SigX_max"),
-                                                  d("SigY_min"),
-                                                  d("SigY_max"),
-                                                  d("SigP"),
-                                                  d("SigP_min"),
-                                                  d("SigP_max"),
-                                                  d("HatWidth"),
-                                                  d("KConv"),
-                                                  i("n_restarts"),
-                                                  b("optimize_profile"),
-                                                  d("max_drift_factor"),
-                                                  b("show_profile_failures"));
   }
 
   // Returns the profile fitter, or None for summation alone, so that a profile
@@ -180,9 +143,7 @@ namespace dials { namespace algorithms { namespace boost_python {
     const bool& apply_lorentz,
     int n_threads,
     object profile_1d_ibix_params_obj,
-    object profile_1d_ic_params_obj,
     object profile_3d_gutmann_params_obj,
-    object profile_3d_ic_params_obj,
     object profile_3d_ibix_params_obj,
     double lorentz_wavelength_power) {
     boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
@@ -199,9 +160,7 @@ namespace dials { namespace algorithms { namespace boost_python {
 
     std::shared_ptr<ProfileFitter> profile_fitter =
       make_profile_fitter(profile_1d_ibix_params_obj,
-                          profile_1d_ic_params_obj,
                           profile_3d_gutmann_params_obj,
-                          profile_3d_ic_params_obj,
                           profile_3d_ibix_params_obj);
 
     integrate_reflection_table(reflection_table,
@@ -378,38 +337,6 @@ namespace dials { namespace algorithms { namespace boost_python {
                                                  profile_params_1d_ibix);
   }
 
-  boost::python::tuple calculate_line_profile_for_reflection_1d_ic_wrapper(
-    dials::af::reflection_table& reflection,
-    dxtbx::model::Experiment& experiment,
-    dxtbx::ImageSequence& data,
-    object incident_params_obj,
-    object absorption_params_obj,
-    scitbx::af::shared<double> raw_projected_intensity_out,
-    scitbx::af::shared<double> projected_intensity_out,
-    scitbx::af::shared<double> projected_background_out,
-    scitbx::af::shared<double> tof_z_out,
-    scitbx::af::shared<double> line_profile_out,
-    const bool& apply_lorentz_correction,
-    TOFProfile1DICParams& profile_params_1d_ic) {
-    boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
-    boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params;
-    extract_correction_params(
-      incident_params_obj, absorption_params_obj, incident_params, absorption_params);
-
-    return calculate_line_profile_for_reflection(reflection,
-                                                 experiment,
-                                                 data,
-                                                 incident_params,
-                                                 absorption_params,
-                                                 raw_projected_intensity_out,
-                                                 projected_intensity_out,
-                                                 projected_background_out,
-                                                 tof_z_out,
-                                                 line_profile_out,
-                                                 apply_lorentz_correction,
-                                                 profile_params_1d_ic);
-  }
-
   boost::python::tuple calculate_line_profile_for_reflection_3d_wrapper(
     dials::af::reflection_table& reflection,
     dxtbx::model::Experiment& experiment,
@@ -438,36 +365,6 @@ namespace dials { namespace algorithms { namespace boost_python {
                                                     tof_z_out,
                                                     apply_lorentz_correction,
                                                     profile_params_3d_gutmann);
-  }
-
-  boost::python::tuple calculate_line_profile_for_reflection_3d_ic_wrapper(
-    dials::af::reflection_table& reflection,
-    dxtbx::model::Experiment& experiment,
-    dxtbx::ImageSequence& data,
-    object incident_params_obj,
-    object absorption_params_obj,
-    scitbx::af::shared<double> raw_projected_intensity_out,
-    scitbx::af::shared<double> projected_intensity_out,
-    scitbx::af::shared<double> projected_background_out,
-    scitbx::af::shared<double> tof_z_out,
-    const bool& apply_lorentz_correction,
-    TOFProfile3DICParams& profile_params_3d_ic) {
-    boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
-    boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params;
-    extract_correction_params(
-      incident_params_obj, absorption_params_obj, incident_params, absorption_params);
-
-    return calculate_line_profile_for_reflection_3d(reflection,
-                                                    experiment,
-                                                    data,
-                                                    incident_params,
-                                                    absorption_params,
-                                                    raw_projected_intensity_out,
-                                                    projected_intensity_out,
-                                                    projected_background_out,
-                                                    tof_z_out,
-                                                    apply_lorentz_correction,
-                                                    profile_params_3d_ic);
   }
 
   boost::python::tuple calculate_line_profile_for_reflection_3d_ibix_wrapper(
@@ -536,9 +433,8 @@ namespace dials { namespace algorithms { namespace boost_python {
   Profile3DShape shape_from_tuple(tuple s) {
     DIALS_ASSERT(len(s) == 8);
     Profile3DShape shape;
-    shape.alpha = extract<double>(s[0]);
-    shape.beta = extract<double>(s[1]);
-    shape.sigma = extract<double>(s[2]);
+    shape.line = LineShape::ibix(
+      extract<double>(s[0]), extract<double>(s[1]), extract<double>(s[2]));
     shape.sig_x = extract<double>(s[3]);
     shape.sig_y = extract<double>(s[4]);
     shape.sig_p = extract<double>(s[5]);
@@ -564,9 +460,9 @@ namespace dials { namespace algorithms { namespace boost_python {
     out["variance"] = r.variance;
     out["correlation"] = r.correlation;
     out["chi2"] = r.chi2;
-    out["shape"] = make_tuple(r.shape.alpha,
-                              r.shape.beta,
-                              r.shape.sigma,
+    out["shape"] = make_tuple(r.shape.line.p[0],
+                              r.shape.line.p[1],
+                              r.shape.line.p[2],
                               r.shape.sig_x,
                               r.shape.sig_y,
                               r.shape.sig_p,
@@ -669,25 +565,6 @@ namespace dials { namespace algorithms { namespace boost_python {
       .def_readwrite("library_min_corr", &TOFProfile3DIBIXParams::library_min_corr)
       .def_readwrite("position_tolerance", &TOFProfile3DIBIXParams::position_tolerance);
 
-    class_<TOFProfile1DICParams, std::shared_ptr<TOFProfile1DICParams>>(
-      "TOFProfile1DICParams", no_init)
-      .def("__init__", make_constructor(&make_TOFProfile1DICParams))
-      .def_readwrite("A", &TOFProfile1DICParams::A)
-      .def_readwrite("A_min", &TOFProfile1DICParams::A_min)
-      .def_readwrite("A_max", &TOFProfile1DICParams::A_max)
-      .def_readwrite("B", &TOFProfile1DICParams::B)
-      .def_readwrite("B_min", &TOFProfile1DICParams::B_min)
-      .def_readwrite("B_max", &TOFProfile1DICParams::B_max)
-      .def_readwrite("R", &TOFProfile1DICParams::R)
-      .def_readwrite("R_min", &TOFProfile1DICParams::R_min)
-      .def_readwrite("R_max", &TOFProfile1DICParams::R_max)
-      .def_readwrite("HatWidth", &TOFProfile1DICParams::HatWidth)
-      .def_readwrite("KConv", &TOFProfile1DICParams::KConv)
-      .def_readwrite("n_restarts", &TOFProfile1DICParams::n_restarts)
-      .def_readwrite("optimize_profile", &TOFProfile1DICParams::optimize_profile)
-      .def_readwrite("show_profile_failures",
-                     &TOFProfile1DICParams::show_profile_failures);
-
     class_<TOFProfile3DGutmannParams>("TOFProfile3DGutmannParams", no_init)
       .def(
         init<double, double, double, double, double, double, int, bool, bool, bool>())
@@ -702,33 +579,6 @@ namespace dials { namespace algorithms { namespace boost_python {
       .def_readwrite("use_central_diff", &TOFProfile3DGutmannParams::use_central_diff)
       .def_readwrite("show_profile_failures",
                      &TOFProfile3DGutmannParams::show_profile_failures);
-
-    class_<TOFProfile3DICParams, std::shared_ptr<TOFProfile3DICParams>>(
-      "TOFProfile3DICParams", no_init)
-      .def("__init__", make_constructor(&make_TOFProfile3DICParams))
-      .def_readwrite("A", &TOFProfile3DICParams::A)
-      .def_readwrite("A_min", &TOFProfile3DICParams::A_min)
-      .def_readwrite("A_max", &TOFProfile3DICParams::A_max)
-      .def_readwrite("B", &TOFProfile3DICParams::B)
-      .def_readwrite("B_min", &TOFProfile3DICParams::B_min)
-      .def_readwrite("B_max", &TOFProfile3DICParams::B_max)
-      .def_readwrite("R", &TOFProfile3DICParams::R)
-      .def_readwrite("R_min", &TOFProfile3DICParams::R_min)
-      .def_readwrite("R_max", &TOFProfile3DICParams::R_max)
-      .def_readwrite("SigX_min", &TOFProfile3DICParams::SigX_min)
-      .def_readwrite("SigX_max", &TOFProfile3DICParams::SigX_max)
-      .def_readwrite("SigY_min", &TOFProfile3DICParams::SigY_min)
-      .def_readwrite("SigY_max", &TOFProfile3DICParams::SigY_max)
-      .def_readwrite("SigP", &TOFProfile3DICParams::SigP)
-      .def_readwrite("SigP_min", &TOFProfile3DICParams::SigP_min)
-      .def_readwrite("SigP_max", &TOFProfile3DICParams::SigP_max)
-      .def_readwrite("HatWidth", &TOFProfile3DICParams::HatWidth)
-      .def_readwrite("KConv", &TOFProfile3DICParams::KConv)
-      .def_readwrite("n_restarts", &TOFProfile3DICParams::n_restarts)
-      .def_readwrite("optimize_profile", &TOFProfile3DICParams::optimize_profile)
-      .def_readwrite("max_drift_factor", &TOFProfile3DICParams::max_drift_factor)
-      .def_readwrite("show_profile_failures",
-                     &TOFProfile3DICParams::show_profile_failures);
 
     def("tof_calculate_ellipse_shoebox_mask",
         &tof_calculate_ellipse_shoebox_mask,
@@ -811,9 +661,7 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("apply_lorentz_correction"),
          arg("n_threads"),
          arg("profile_1d_ibix_params") = object(),
-         arg("profile_1d_ic_params") = object(),
          arg("profile_3d_gutmann_params") = object(),
-         arg("profile_3d_ic_params") = object(),
          arg("profile_3d_ibix_params") = object(),
          arg("lorentz_wavelength_power") = 4.0));
 
@@ -845,21 +693,6 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("apply_lorentz_correction"),
          arg("profile_params_1d_ibix")));
 
-    def("calculate_line_profile_for_reflection",
-        &calculate_line_profile_for_reflection_1d_ic_wrapper,
-        (arg("reflection"),
-         arg("experiment"),
-         arg("data"),
-         arg("incident_params"),
-         arg("absorption_params"),
-         arg("raw_projected_intensity_out"),
-         arg("projected_intensity_out"),
-         arg("projected_background_out"),
-         arg("tof_z_out"),
-         arg("line_profile_out"),
-         arg("apply_lorentz_correction"),
-         arg("profile_params_1d_ic")));
-
     def("calculate_line_profile_for_reflection_3d",
         &calculate_line_profile_for_reflection_3d_wrapper,
         (arg("reflection"),
@@ -873,20 +706,6 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("tof_z_out"),
          arg("apply_lorentz_correction"),
          arg("profile_params_3d_gutmann")));
-
-    def("calculate_line_profile_for_reflection_3d",
-        &calculate_line_profile_for_reflection_3d_ic_wrapper,
-        (arg("reflection"),
-         arg("experiment"),
-         arg("data"),
-         arg("incident_params"),
-         arg("absorption_params"),
-         arg("raw_projected_intensity_out"),
-         arg("projected_intensity_out"),
-         arg("projected_background_out"),
-         arg("tof_z_out"),
-         arg("apply_lorentz_correction"),
-         arg("profile_params_3d_ic")));
 
     def("calculate_line_profile_for_reflection_3d",
         &calculate_line_profile_for_reflection_3d_ibix_wrapper,

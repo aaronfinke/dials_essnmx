@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <memory>
 #include <vector>
-#include <dials/algorithms/integration/tof/tof_profile_1d_ibix.h>
+#include <dials/algorithms/integration/tof/tof_line_shape.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_bvg.h>
 
 /*
@@ -31,18 +31,6 @@ namespace dials { namespace algorithms {
     double y = 0.0;
     double t = 0.0;
   };
-
-  /*
-   * The centroid of the iBIX ToF line shape relative to its T_ph parameter.
-   * The shape is a rising exponential (rate alpha) joined to a falling one
-   * (rate beta), convolved with a Gaussian, whose mean is 1/beta - 1/alpha.
-   * T_ph is therefore not where the peak is, and how far off it is depends on
-   * the shape, so the position of a peak is carried as its centroid: that can
-   * be compared between reflections of different shape.
-   */
-  inline double ibix_centroid_offset(const IBIXShape& shape) {
-    return 1.0 / shape.beta - 1.0 / shape.alpha;
-  }
 
   class PeakShape {
   public:
@@ -74,14 +62,14 @@ namespace dials { namespace algorithms {
   };
 
   /*
-   * The iBIX line shape in ToF (back-to-back exponentials convolved with a
-   * Gaussian) times a bivariate Gaussian on the detector face, whose centre
-   * may move linearly with ToF. Used by profile_1d_ibix (with the face
-   * measured separately and no drift) and profile_3d_ibix.
+   * A line shape in ToF (LineShape: iBIX or Ikeda-Carpenter) times a
+   * bivariate Gaussian on the detector face, whose centre may move linearly
+   * with ToF. Used by the 1D methods (with the face measured separately and no
+   * drift) and the 3D methods.
    */
-  class IBIXGaussianShape : public PeakShape {
+  class LineGaussianShape : public PeakShape {
   public:
-    IBIXShape line;      // T_ph unused: the position is given to box_profile
+    LineShape line;
     double sig_x = 0.0;  // detector face (px)
     double sig_y = 0.0;
     double sig_p = 0.0;
@@ -95,7 +83,7 @@ namespace dials { namespace algorithms {
                      const std::vector<double>& tof,
                      const PeakPosition& centre,
                      std::vector<double>& profile) const override {
-      if (!line.valid) {
+      if (!line.positive()) {
         return false;
       }
       const std::size_t nz = tof.size();
@@ -104,9 +92,7 @@ namespace dials { namespace algorithms {
       for (std::size_t z = 0; z < nz; ++z) {
         tof_axis[z] = tof[z];
       }
-      const double t_ph = centre.t - ibix_centroid_offset(line);
-      scitbx::af::shared<double> raw = profile1d_func(
-        tof_axis.const_ref(), 1.0, line.alpha, line.beta, line.sigma, t_ph);
+      scitbx::af::shared<double> raw = line.evaluate(tof_axis.const_ref(), centre.t);
       std::vector<double> tof_profile(nz, 0.0);
       for (std::size_t z = 0; z < nz; ++z) {
         double v = raw[z];
@@ -161,9 +147,9 @@ namespace dials { namespace algorithms {
      * the line shape is already a function convolved with a Gaussian. The
      * correlation on the face keeps its covariance.
      */
-    IBIXGaussianShape broadened_copy(const PeakPosition& scatter) const {
-      IBIXGaussianShape out(*this);
-      out.line.sigma = std::sqrt(line.sigma * line.sigma + scatter.t * scatter.t);
+    LineGaussianShape broadened_copy(const PeakPosition& scatter) const {
+      LineGaussianShape out(*this);
+      out.line = line.broadened(scatter.t);
       out.sig_x = std::sqrt(sig_x * sig_x + scatter.x * scatter.x);
       out.sig_y = std::sqrt(sig_y * sig_y + scatter.y * scatter.y);
       out.sig_p = sig_p * sig_x * sig_y / (out.sig_x * out.sig_y);
@@ -172,12 +158,13 @@ namespace dials { namespace algorithms {
 
     std::shared_ptr<const PeakShape> broadened(
       const PeakPosition& scatter) const override {
-      return std::make_shared<IBIXGaussianShape>(broadened_copy(scatter));
+      return std::make_shared<LineGaussianShape>(broadened_copy(scatter));
     }
 
     // Finite widths on every axis
     bool usable() const {
-      return line.valid && std::isfinite(line.sigma) && sig_x > 0.0 && sig_y > 0.0;
+      return line.positive() && std::isfinite(line.p[line.width_index()]) && sig_x > 0.0
+             && sig_y > 0.0;
     }
   };
 

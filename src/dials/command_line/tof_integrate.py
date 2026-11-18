@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import multiprocessing
 import re
 import sys
@@ -32,10 +33,8 @@ from dials.util.phil import parse
 from dials.util.version import dials_version
 from dials_algorithms_tof_integration_ext import (
     TOFProfile1DIBIXParams,
-    TOFProfile1DICParams,
     TOFProfile3DGutmannParams,
     TOFProfile3DIBIXParams,
-    TOFProfile3DICParams,
     integrate_reflection_table,
     tof_assign_overlap_ownership,
     tof_calculate_ellipse_shoebox_mask,
@@ -311,43 +310,85 @@ profile_1d_profilelib
         .help = "Allowed relative difference between a shape fit's peak height"
                 "and the height of the data."
 }
-profile_1d_ic{
+profile_1d_ic
+    .help = "The Ikeda-Carpenter line shape (fast and slow moderator"
+            "components, convolved with a rectangle and a Gaussian) fitted to"
+            "the ToF projection of each reflection. With library.build, the"
+            "shape is measured on strong reflections only and every"
+            "reflection is fitted with the shape of the nearest of those held"
+            "fixed. Decay constants in 1/us, convolution widths in ToF slices."
+{
     init_A = 1.0
         .type = float
-        .help = "Initial fast-neutron decay constant before optimization"
+        .help = "Initial fast-neutron decay constant (1/us)"
     min_A = 0.1
         .type = float
-        .help = "Min fast-neutron decay constant for optimization"
+        .help = "Min fast-neutron decay constant (1/us)"
     max_A = 20.0
         .type = float
-        .help = "Max fast-neutron decay constant for optimization"
+        .help = "Max fast-neutron decay constant (1/us)"
     init_B = 0.05
         .type = float
-        .help = "Initial slow-neutron decay constant before optimization"
+        .help = "Initial slow-neutron decay constant (1/us)"
     min_B = 1e-4
         .type = float
-        .help = "Min slow-neutron decay constant for optimization"
+        .help = "Min slow-neutron decay constant (1/us)"
     max_B = 5.0
         .type = float
-        .help = "Max slow-neutron decay constant for optimization"
+        .help = "Max slow-neutron decay constant (1/us)"
     init_R = 0.5
         .type = float
-        .help = "Initial fast/slow neutron ratio before optimization"
+        .help = "Initial fast/slow neutron ratio"
     min_R = 0.0
         .type = float
-        .help = "Min fast/slow neutron ratio for optimization"
+        .help = "Min fast/slow neutron ratio"
     max_R = 1.0
         .type = float
-        .help = "Max fast/slow neutron ratio for optimization"
+        .help = "Max fast/slow neutron ratio"
     hat_width = 1.0
         .type = float
-        .help = "Initial half-width of the rectangular convolution kernel (ToF bins)"
+        .help = "Initial half-width of the rectangular convolution kernel, in"
+                "ToF slices (fitted between 0.5 and 20)"
     kconv = 0.1
         .type = float
-        .help = "Initial Gaussian convolution kernel decay rate (per ToF bin^2)"
+        .help = "Initial Gaussian convolution kernel decay rate, per ToF slice"
+                "squared: sigma = 1/sqrt(2 kconv) slices (fitted between 0.02"
+                "and 5)"
     n_restarts = 100
         .type = int(value_min=0)
-        .help = "If fit fails, number of additional attempts with perturbed params"
+        .help = "If a fit fails, number of additional attempts with perturbed"
+                "params"
+    min_correlation = 0.9
+        .type = float(value_min=0, value_max=1)
+        .help = "Correlation with the data a free fit must reach to be accepted."
+    peak_tolerance = None
+        .type = float(value_min=0)
+        .help = "How far in us a fit's peak may sit from the tallest channel of"
+                "the data. None: three bins, whatever their width."
+    peak_height_smoothing = 0.0
+        .type = float(value_min=0)
+        .help = "Time in us to smooth the data over before measuring its peak"
+                "height; 0 compares against the raw maximum."
+    peak_height_fraction = 0.1
+        .type = float(value_min=0)
+        .help = "Allowed relative difference between a fit's peak height and the"
+                "height of the data."
+    library{
+        build = False
+            .type = bool
+            .help = "Measure the shape on strong reflections, and fit every"
+                    "reflection with the shape of the nearest of those held"
+                    "fixed. Needed for overlaps.mode=deconvolve and"
+                    "overlaps.estimator=joint."
+        min_i_sigma = 5.0
+            .type = float(value_min=0)
+            .help = "Summation I/sigma a reflection must reach for its fitted"
+                    "shape to enter the library."
+        min_correlation = 0.5
+            .type = float(value_min=0, value_max=1)
+            .help = "Correlation a free fit must reach for its shape to enter"
+                    "the library."
+    }
 }
 profile_3d_gutmann{
     init_alpha = 1.0
@@ -375,68 +416,109 @@ profile_3d_gutmann{
         .type = choice
         .help = "Method used to calculate gradients"
 }
-profile_3d_ic{
+profile_3d_ic
+    .help = "The Ikeda-Carpenter line shape in ToF times a bivariate Gaussian"
+            "on the detector face, whose centre may drift linearly with ToF,"
+            "fitted in 3D to the voxels of each reflection. ToF is in us, as in"
+            "profile_1d_ic. With library.build, every parameter is fitted on"
+            "reflections strong enough to determine it, and every reflection"
+            "is fitted with the shape of the nearest of those held fixed."
+{
     init_A = 1.0
         .type = float
-        .help = "Initial fast-neutron decay constant before optimization"
+        .help = "Initial fast-neutron decay constant (1/us)"
     min_A = 0.1
         .type = float
-        .help = "Min fast-neutron decay constant for optimization"
+        .help = "Min fast-neutron decay constant (1/us)"
     max_A = 20.0
         .type = float
-        .help = "Max fast-neutron decay constant for optimization"
+        .help = "Max fast-neutron decay constant (1/us)"
     init_B = 0.05
         .type = float
-        .help = "Initial slow-neutron decay constant before optimization"
+        .help = "Initial slow-neutron decay constant (1/us)"
     min_B = 1e-4
         .type = float
-        .help = "Min slow-neutron decay constant for optimization"
+        .help = "Min slow-neutron decay constant (1/us)"
     max_B = 5.0
         .type = float
-        .help = "Max slow-neutron decay constant for optimization"
+        .help = "Max slow-neutron decay constant (1/us)"
     init_R = 0.5
         .type = float
-        .help = "Initial fast/slow neutron ratio before optimization"
+        .help = "Initial fast/slow neutron ratio"
     min_R = 0.0
         .type = float
-        .help = "Min fast/slow neutron ratio for optimization"
+        .help = "Min fast/slow neutron ratio"
     max_R = 1.0
         .type = float
-        .help = "Max fast/slow neutron ratio for optimization"
-    min_sig_x = 0.05
-        .type = float
-        .help = "Min bivariate Gaussian sigma X for optimization"
-    max_sig_x = 20.0
-        .type = float
-        .help = "Max bivariate Gaussian sigma X for optimization"
-    min_sig_y = 0.05
-        .type = float
-        .help = "Min bivariate Gaussian sigma Y for optimization"
-    max_sig_y = 20.0
-        .type = float
-        .help = "Max bivariate Gaussian sigma Y for optimization"
-    init_sig_p = 0.0
-        .type = float
-        .help = "Initial bivariate Gaussian spatial correlation before optimization"
-    min_sig_p = -0.99
-        .type = float
-        .help = "Min bivariate Gaussian spatial correlation for optimization"
-    max_sig_p = 0.99
-        .type = float
-        .help = "Max bivariate Gaussian spatial correlation for optimization"
+        .help = "Max fast/slow neutron ratio"
     hat_width = 1.0
         .type = float
-        .help = "Initial half-width of the rectangular convolution kernel (ToF bins)"
+        .help = "Initial half-width of the rectangular convolution kernel, in"
+                "ToF slices (fitted between 0.5 and 20)"
     kconv = 0.1
         .type = float
-        .help = "Initial Gaussian convolution kernel decay rate (per ToF bin^2)"
+        .help = "Initial Gaussian convolution kernel decay rate, per ToF slice"
+                "squared: sigma = 1/sqrt(2 kconv) slices (fitted between 0.02"
+                "and 5)"
+    min_sig_x = 0.05
+        .type = float
+        .help = "Min bivariate Gaussian sigma x (px)"
+    max_sig_x = 20.0
+        .type = float
+        .help = "Max bivariate Gaussian sigma x (px)"
+    min_sig_y = 0.05
+        .type = float
+        .help = "Min bivariate Gaussian sigma y (px)"
+    max_sig_y = 20.0
+        .type = float
+        .help = "Max bivariate Gaussian sigma y (px)"
+    min_sig_p = -0.99
+        .type = float
+        .help = "Min bivariate Gaussian correlation"
+    max_sig_p = 0.99
+        .type = float
+        .help = "Max bivariate Gaussian correlation"
+    max_drift_factor = 1.5
+        .type = float(value_min=0)
+        .help = "Bound on how fast the peak centre may move across the"
+                "detector with ToF: this times the box's extent in pixels"
+                "over its extent in ToF. 0 holds the centre fixed."
     n_restarts = 100
         .type = int(value_min=0)
-        .help = "If fit fails, number of additional attempts with perturbed params"
-    max_drift_factor = 1.5
-        .type = float
-        .help = "Scales the per-reflection dXdt/dYdt bounds relative to the "
-                "shoebox's spatial extent divided by its ToF extent"
+        .help = "If a fit fails, number of further attempts from perturbed"
+                "starting points"
+    min_correlation = 0.75
+        .type = float(value_min=0, value_max=1)
+        .help = "Correlation between model and data over every voxel of the box"
+                "that a reflection fitted on its own must reach to be accepted."
+                "0 disables the test."
+    peak_height_fraction = 0.25
+        .type = float(value_min=0)
+        .help = "Allowed relative difference between the peak height of a"
+                "reflection fitted on its own and the data's tallest voxel. 0"
+                "disables the test."
+    library{
+        build = False
+            .type = bool
+            .help = "Measure the shape on strong reflections, and fit every"
+                    "reflection with the shape of the nearest of those held"
+                    "fixed. Needed for overlaps.mode=deconvolve and"
+                    "overlaps.estimator=joint."
+        min_i_sigma = 10.0
+            .type = float(value_min=0)
+            .help = "Summation I/sigma a reflection must reach for its fitted"
+                    "shape to enter the library."
+        min_correlation = 0.5
+            .type = float(value_min=0, value_max=1)
+            .help = "Correlation over the peak a free fit must reach for its"
+                    "shape to enter the library."
+        free_position_min_i_sigma = 10.0
+            .type = float
+            .help = "As profile_3d_ibix.library.free_position_min_i_sigma"
+        position_tolerance = 3.0
+            .type = float(value_min=0)
+            .help = "As profile_3d_ibix.library.position_tolerance"
+    }
 }
 profile_3d_ibix
     .help = "The iBIX line shape in ToF times a bivariate Gaussian on the"
@@ -818,6 +900,29 @@ def get_spectrum_correction_params(**kwargs: Dict) -> Tuple:
     return incident_params, absorption_params
 
 
+def ic_line_shape(p: libtbx.phil.scope_extract) -> dict:
+    """
+    The Ikeda-Carpenter line shape of a profile_1d_ic or profile_3d_ic scope,
+    as the shared fitters take it: A, B, R, then the hat half-width and the
+    Gaussian sigma in ToF slices (the scope's kconv converted to a sigma).
+    """
+
+    def sigma(kconv):
+        return 1.0 / math.sqrt(2.0 * kconv)
+
+    for v in ("A", "B", "R"):
+        if getattr(p, f"min_{v}") > getattr(p, f"max_{v}"):
+            raise ValueError(f"min_{v} > max_{v}")
+    if not (p.hat_width > 0 and p.kconv > 0):
+        raise ValueError("hat_width and kconv must be positive")
+    return {
+        "line_kind": "ic",
+        "line_init": [p.init_A, p.init_B, p.init_R, p.hat_width, sigma(p.kconv)],
+        "line_min": [p.min_A, p.min_B, p.min_R, 0.5, sigma(5.0)],
+        "line_max": [p.max_A, p.max_B, p.max_R, 20.0, sigma(0.02)],
+    }
+
+
 def make_profile_1d_ibix_params(
     params: libtbx.phil.scope_extract, show_profile_failures: bool
 ) -> object:
@@ -826,6 +931,42 @@ def make_profile_1d_ibix_params(
     profile_1d_profilelib: profile_1d_ibix with the library built, and the
     parameters of its own scope, which are the values recommended for MANDI.
     """
+    if params.method == "profile_1d_ic":
+        p = params.profile_1d_ic
+        build_library = p.library.build
+        line = ic_line_shape(p)
+        if build_library:
+            logger.info(
+                "    Measuring peak shapes on reflections with I/sigma >= "
+                f"{p.library.min_i_sigma} whose fit correlates >= "
+                f"{p.library.min_correlation}, then holding them fixed elsewhere"
+            )
+        return TOFProfile1DIBIXParams(
+            {
+                # The amplitude, here, and A in the line shape the decay
+                "A_min": 1e-6,
+                "A_max": 1e8,
+                "alpha": 0.0,
+                "alpha_min": 0.0,
+                "alpha_max": 0.0,
+                "beta": 0.0,
+                "beta_min": 0.0,
+                "beta_max": 0.0,
+                "n_restarts": p.n_restarts,
+                "optimize_profile": True,
+                "show_profile_failures": show_profile_failures,
+                "peak_height_smoothing": p.peak_height_smoothing,
+                "trust_min_corr": p.min_correlation,
+                "trust_peak_tolerance": p.peak_tolerance
+                if p.peak_tolerance is not None
+                else 0.0,
+                "trust_peak_height_fraction": p.peak_height_fraction,
+                "library_min_i_sigma": p.library.min_i_sigma,
+                "library_min_corr": p.library.min_correlation,
+                "build_library": build_library,
+                **line,
+            }
+        )
     if params.method == "profile_1d_profilelib":
         logger.warning(
             "    method=profile_1d_profilelib is deprecated: use"
@@ -887,6 +1028,46 @@ def make_profile_3d_ibix_params(
     profile_3d_profilelib: profile_3d_ibix with the library built, and the
     parameters of its own scope, which are the values recommended for MANDI.
     """
+    if params.method == "profile_3d_ic":
+        p = params.profile_3d_ic
+        line = ic_line_shape(p)
+        for v in ("sig_x", "sig_y", "sig_p"):
+            if getattr(p, f"min_{v}") >= getattr(p, f"max_{v}"):
+                raise ValueError(f"profile_3d_ic.min_{v} must be below max_{v}")
+        if p.library.build:
+            logger.info(
+                "    Measuring 3D peak shapes on reflections with I/sigma >= "
+                f"{p.library.min_i_sigma} whose fit correlates >= "
+                f"{p.library.min_correlation}, then holding them fixed elsewhere"
+            )
+        return TOFProfile3DIBIXParams(
+            {
+                "alpha": 0.0,
+                "alpha_min": 0.0,
+                "alpha_max": 0.0,
+                "beta": 0.0,
+                "beta_min": 0.0,
+                "beta_max": 0.0,
+                "SigX_min": p.min_sig_x,
+                "SigX_max": p.max_sig_x,
+                "SigY_min": p.min_sig_y,
+                "SigY_max": p.max_sig_y,
+                "SigP_min": p.min_sig_p,
+                "SigP_max": p.max_sig_p,
+                "max_drift_factor": p.max_drift_factor,
+                "n_restarts": p.n_restarts,
+                "show_profile_failures": show_profile_failures,
+                "library_min_i_sigma": p.library.min_i_sigma,
+                "library_min_corr": p.library.min_correlation,
+                "position_tolerance": p.library.position_tolerance,
+                "free_position_min_i_sigma": p.library.free_position_min_i_sigma,
+                "min_corr": p.library.min_correlation,
+                "free_fit_box_min_corr": p.min_correlation,
+                "free_fit_peak_height_fraction": p.peak_height_fraction,
+                "build_library": p.library.build,
+                **line,
+            }
+        )
     if params.method == "profile_3d_profilelib":
         logger.warning(
             "    method=profile_3d_profilelib is deprecated: use"
@@ -964,9 +1145,7 @@ def integrate_reflection_table_for_experiment(
     """
     apply_lorentz = params.corrections.lorentz
     profile_1d_ibix_params = None
-    profile_1d_ic_params = None
     profile_3d_gutmann_params = None
-    profile_3d_ic_params = None
     profile_3d_ibix_params = None
 
     logger.info(f"    Integrating using {params.method}")
@@ -977,25 +1156,8 @@ def integrate_reflection_table_for_experiment(
             params, show_profile_failures
         )
     elif params.method == "profile_1d_ic":
-        p = params.profile_1d_ic
-        # dict needed due to boost limit of 15 template arguments
-        profile_1d_ic_params = TOFProfile1DICParams(
-            {
-                "A": p.init_A,
-                "A_min": p.min_A,
-                "A_max": p.max_A,
-                "B": p.init_B,
-                "B_min": p.min_B,
-                "B_max": p.max_B,
-                "R": p.init_R,
-                "R_min": p.min_R,
-                "R_max": p.max_R,
-                "HatWidth": p.hat_width,
-                "KConv": p.kconv,
-                "n_restarts": p.n_restarts,
-                "optimize_profile": True,
-                "show_profile_failures": show_profile_failures,
-            }
+        profile_1d_ibix_params = make_profile_1d_ibix_params(
+            params, show_profile_failures
         )
     elif params.method == "profile_3d_gutmann":
         alpha = params.profile_3d_gutmann.init_alpha
@@ -1021,33 +1183,8 @@ def integrate_reflection_table_for_experiment(
             show_profile_failures,
         )
     elif params.method == "profile_3d_ic":
-        p = params.profile_3d_ic
-        # dict needed due to boost limit of 15 template arguments
-        profile_3d_ic_params = TOFProfile3DICParams(
-            {
-                "A": p.init_A,
-                "A_min": p.min_A,
-                "A_max": p.max_A,
-                "B": p.init_B,
-                "B_min": p.min_B,
-                "B_max": p.max_B,
-                "R": p.init_R,
-                "R_min": p.min_R,
-                "R_max": p.max_R,
-                "SigX_min": p.min_sig_x,
-                "SigX_max": p.max_sig_x,
-                "SigY_min": p.min_sig_y,
-                "SigY_max": p.max_sig_y,
-                "SigP": p.init_sig_p,
-                "SigP_min": p.min_sig_p,
-                "SigP_max": p.max_sig_p,
-                "HatWidth": p.hat_width,
-                "KConv": p.kconv,
-                "n_restarts": p.n_restarts,
-                "optimize_profile": True,
-                "max_drift_factor": p.max_drift_factor,
-                "show_profile_failures": show_profile_failures,
-            }
+        profile_3d_ibix_params = make_profile_3d_ibix_params(
+            params, show_profile_failures
         )
     elif params.method in ("profile_3d_ibix", "profile_3d_profilelib"):
         profile_3d_ibix_params = make_profile_3d_ibix_params(
@@ -1072,9 +1209,7 @@ def integrate_reflection_table_for_experiment(
         apply_lorentz,
         params.mp.nproc,
         profile_1d_ibix_params,
-        profile_1d_ic_params,
         profile_3d_gutmann_params,
-        profile_3d_ic_params,
         profile_3d_ibix_params,
         params.corrections.lorentz_wavelength_power,
     )
@@ -1925,7 +2060,8 @@ def run_integrate(
         "profile_1d_profilelib",
         "profile_3d_profilelib",
     ) or (
-        params.method in ("profile_1d_ibix", "profile_3d_ibix")
+        params.method
+        in ("profile_1d_ibix", "profile_3d_ibix", "profile_1d_ic", "profile_3d_ic")
         and getattr(params, params.method).library.build
     )
     for option, active in (
@@ -1935,8 +2071,8 @@ def run_integrate(
         if active and not builds_library:
             raise ValueError(
                 f"{option} takes its peak shapes from the profile library, and"
-                " requires method=profile_1d_ibix or profile_3d_ibix with"
-                " library.build=True"
+                " requires a profile method (profile_1d_ibix, profile_3d_ibix,"
+                " profile_1d_ic or profile_3d_ic) with library.build=True"
             )
 
     reflections, _ = process_reference(reflections)

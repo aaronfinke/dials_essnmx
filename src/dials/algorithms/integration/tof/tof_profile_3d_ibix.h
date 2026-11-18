@@ -10,6 +10,7 @@
 #include <eigen3/Eigen/Dense>
 #include <eigen3/unsupported/Eigen/NonLinearOptimization>
 #include <dials/algorithms/integration/tof/tof_peak_shape.h>
+#include <dials/algorithms/integration/tof/tof_line_shape.h>
 #include <dials/algorithms/integration/tof/tof_profile_1d_ibix.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_bvg.h>
 
@@ -28,7 +29,7 @@ on the detector at that time is (x0, y0):
   T_ph  = t0 - (1/beta - 1/alpha)
 
 The position is carried as the centroid t0 rather than as T_ph, which is not
-where the peak is and moves with the shape (see ibix_centroid_offset), so that
+where the peak is and moves with the shape (see LineShape), so that
 positions of reflections with different shapes can be compared. The profile is
 normalised to unit sum over the bounding box, so A is the intensity inside the
 box: the quantity summation measures.
@@ -65,9 +66,17 @@ Choices that differ from the 3D fit this replaced:
 namespace dials { namespace algorithms {
 
   struct TOFProfile3DIBIXParams {
-    double alpha, alpha_min, alpha_max;  // line shape rise (1/us)
-    double beta, beta_min, beta_max;     // line shape decay (1/us)
-    double SigX_min, SigX_max;           // detector face widths (px)
+    /*
+     * The line shape fitted, its starting values and bounds, in the order of
+     * LineShape::p. iBIX: alpha and beta (1/us); sigma is taken from the data.
+     * Ikeda-Carpenter: A and B (1/us), R, and the hat half-width and Gaussian
+     * sigma in slices of the box, converted to us on each.
+     */
+    LineShape::Kind line_kind = LineShape::IBIX;
+    std::array<double, 5> line_init = {{0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<double, 5> line_min = {{0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<double, 5> line_max = {{0.0, 0.0, 0.0, 0.0, 0.0}};
+    double SigX_min, SigX_max;  // detector face widths (px)
     double SigY_min, SigY_max;
     double SigP_min, SigP_max;  // detector face correlation
     double max_drift_factor;  // bound on drift: box extent over ToF extent, times this
@@ -110,13 +119,7 @@ namespace dials { namespace algorithms {
                            double library_min_corr_,
                            double position_tolerance_,
                            double free_position_min_i_sigma_)
-        : alpha(alpha_),
-          alpha_min(alpha_min_),
-          alpha_max(alpha_max_),
-          beta(beta_),
-          beta_min(beta_min_),
-          beta_max(beta_max_),
-          SigX_min(SigX_min_),
+        : SigX_min(SigX_min_),
           SigX_max(SigX_max_),
           SigY_min(SigY_min_),
           SigY_max(SigY_max_),
@@ -128,14 +131,16 @@ namespace dials { namespace algorithms {
           library_min_i_sigma(library_min_i_sigma_),
           library_min_corr(library_min_corr_),
           position_tolerance(position_tolerance_),
-          free_position_min_i_sigma(free_position_min_i_sigma_) {}
+          free_position_min_i_sigma(free_position_min_i_sigma_) {
+      line_init = {{alpha_, beta_, 0.0, 0.0, 0.0}};
+      line_min = {{alpha_min_, beta_min_, 0.0, 0.0, 0.0}};
+      line_max = {{alpha_max_, beta_max_, 0.0, 0.0, 0.0}};
+    }
   };
 
   // A peak shape in 3D, as fitted on one reflection and reusable on another
   struct Profile3DShape {
-    double alpha = 0.0;  // line shape (1/us, 1/us, us)
-    double beta = 0.0;
-    double sigma = 0.0;
+    LineShape line;      // in ToF
     double sig_x = 0.0;  // detector face (px)
     double sig_y = 0.0;
     double sig_p = 0.0;
@@ -143,9 +148,10 @@ namespace dials { namespace algorithms {
     double drift_y = 0.0;
     bool valid = false;
 
-    // Centroid of the line shape relative to T_ph (us)
-    double centroid_offset() const {
-      return 1.0 / beta - 1.0 / alpha;
+    // Reference time of the line shape (its position) relative to its onset
+    // parameter (us)
+    double reference_offset() const {
+      return line.reference_offset();
     }
   };
 
@@ -218,18 +224,11 @@ namespace dials { namespace algorithms {
                       const Profile3DPosition& p,
                       std::vector<double>& out) {
       out.assign(d.size(), 0.0);
-      if (!(s.alpha > 0.0) || !(s.beta > 0.0) || !(s.sigma > 0.0) || !(s.sig_x > 0.0)
-          || !(s.sig_y > 0.0)) {
+      if (!s.line.positive() || !(s.sig_x > 0.0) || !(s.sig_y > 0.0)) {
         return false;
       }
-      const double T_ph = p.t - s.centroid_offset();
       scitbx::af::shared<double> line =
-        profile1d_func(scitbx::af::const_ref<double>(d.t.data(), d.t.size()),
-                       1.0,
-                       s.alpha,
-                       s.beta,
-                       s.sigma,
-                       T_ph);
+        s.line.evaluate(scitbx::af::const_ref<double>(d.t.data(), d.t.size()), p.t);
       for (std::size_t iz = 0; iz < d.nz; ++iz) {
         if (!std::isfinite(line[iz]) || line[iz] < 0.0) {
           line[iz] = 0.0;
@@ -333,17 +332,22 @@ namespace dials { namespace algorithms {
 
     /*
      * The parameters a fit varies, carried internally unbounded (see
-     * bounded_to_internal). With free_shape, in order: alpha, beta, sigma,
-     * sig_x, sig_y, sig_p, drift_x, drift_y, x, y, t. Otherwise x, y, t only,
-     * with the rest of the shape as given.
+     * bounded_to_internal). With free_shape, in order: the line shape's
+     * parameters (LineShape::p), sig_x, sig_y, sig_p, drift_x, drift_y, x, y, t.
+     * Otherwise x, y, t only, with the rest of the shape as given (and the
+     * line shape's kind always taken from fixed_shape).
      */
     struct Parameterisation {
       bool free_shape = false;
       Profile3DShape fixed_shape;
       std::vector<double> lo, hi;
 
+      int n_line() const {
+        return fixed_shape.line.n_params();
+      }
+
       int size() const {
-        return free_shape ? 11 : 3;
+        return free_shape ? n_line() + 8 : 3;
       }
 
       void decode(const Eigen::VectorXd& u,
@@ -356,15 +360,16 @@ namespace dials { namespace algorithms {
         shape = fixed_shape;
         int k = 0;
         if (free_shape) {
-          shape.alpha = p[0];
-          shape.beta = p[1];
-          shape.sigma = p[2];
-          shape.sig_x = p[3];
-          shape.sig_y = p[4];
-          shape.sig_p = p[5];
-          shape.drift_x = p[6];
-          shape.drift_y = p[7];
-          k = 8;
+          const int n = n_line();
+          for (int j = 0; j < n; ++j) {
+            shape.line.p[j] = p[j];
+          }
+          shape.sig_x = p[n];
+          shape.sig_y = p[n + 1];
+          shape.sig_p = p[n + 2];
+          shape.drift_x = p[n + 3];
+          shape.drift_y = p[n + 4];
+          k = n + 5;
         }
         position.x = p[k];
         position.y = p[k + 1];
@@ -375,14 +380,14 @@ namespace dials { namespace algorithms {
                              const Profile3DPosition& position) const {
         std::vector<double> p;
         if (free_shape) {
-          p = {shape.alpha,
-               shape.beta,
-               shape.sigma,
-               shape.sig_x,
-               shape.sig_y,
-               shape.sig_p,
-               shape.drift_x,
-               shape.drift_y};
+          for (int j = 0; j < n_line(); ++j) {
+            p.push_back(shape.line.p[j]);
+          }
+          p.push_back(shape.sig_x);
+          p.push_back(shape.sig_y);
+          p.push_back(shape.sig_p);
+          p.push_back(shape.drift_x);
+          p.push_back(shape.drift_y);
         }
         p.push_back(position.x);
         p.push_back(position.y);
@@ -666,10 +671,30 @@ namespace dials { namespace algorithms {
         return std::min(std::max(v, a + margin), b - margin);
       };
 
+      // The line shape's start and bounds
+      LineShape line, line_lo, line_hi;
+      line.kind = line_lo.kind = line_hi.kind = params.line_kind;
+      if (params.line_kind == LineShape::IBIX) {
+        line.p = {{params.line_init[0], params.line_init[1], sigma0, 0.0, 0.0}};
+        line_lo.p = {{params.line_min[0], params.line_min[1], sigma0 / 4.0, 0.0, 0.0}};
+        line_hi.p = {{params.line_max[0],
+                      params.line_max[1],
+                      std::max(100.0, 4.0 * sigma0),
+                      0.0,
+                      0.0}};
+      } else {
+        // The convolution widths are given in slices
+        for (int j = 0; j < 5; ++j) {
+          double scale = j >= 3 ? mean_dt : 1.0;
+          line.p[j] = params.line_init[j] * scale;
+          line_lo.p[j] = params.line_min[j] * scale;
+          line_hi.p[j] = params.line_max[j] * scale;
+        }
+      }
+      const int n_line = line.n_params();
+
       Profile3DShape& s = seed.shape;
-      s.alpha = params.alpha;
-      s.beta = params.beta;
-      s.sigma = sigma0;
+      s.line = line;
       s.sig_x = std::sqrt(std::max(mxx, 0.0));
       s.sig_y = std::sqrt(std::max(myy, 0.0));
       s.sig_p = (s.sig_x > 0.0 && s.sig_y > 0.0) ? mxy / (s.sig_x * s.sig_y) : 0.0;
@@ -684,28 +709,29 @@ namespace dials { namespace algorithms {
       const double drift_x_max = params.max_drift_factor * d.nx / tof_range;
       const double drift_y_max = params.max_drift_factor * d.ny / tof_range;
       parameterisation.free_shape = true;
-      parameterisation.lo = {params.alpha_min,
-                             params.beta_min,
-                             sigma0 / 4.0,
-                             params.SigX_min,
-                             params.SigY_min,
-                             params.SigP_min,
-                             -drift_x_max,
-                             -drift_y_max,
-                             d.x.front() - 0.5,
-                             d.y.front() - 0.5,
-                             d.t.front()};
-      parameterisation.hi = {params.alpha_max,
-                             params.beta_max,
-                             std::max(100.0, 4.0 * sigma0),
-                             params.SigX_max,
-                             params.SigY_max,
-                             params.SigP_max,
-                             drift_x_max,
-                             drift_y_max,
-                             d.x.back() + 0.5,
-                             d.y.back() + 0.5,
-                             d.t.back()};
+      parameterisation.fixed_shape = s;
+      parameterisation.lo.assign(line_lo.p.begin(), line_lo.p.begin() + n_line);
+      parameterisation.hi.assign(line_hi.p.begin(), line_hi.p.begin() + n_line);
+      std::vector<double> rest_lo = {params.SigX_min,
+                                     params.SigY_min,
+                                     params.SigP_min,
+                                     -drift_x_max,
+                                     -drift_y_max,
+                                     d.x.front() - 0.5,
+                                     d.y.front() - 0.5,
+                                     d.t.front()};
+      std::vector<double> rest_hi = {params.SigX_max,
+                                     params.SigY_max,
+                                     params.SigP_max,
+                                     drift_x_max,
+                                     drift_y_max,
+                                     d.x.back() + 0.5,
+                                     d.y.back() + 0.5,
+                                     d.t.back()};
+      parameterisation.lo.insert(
+        parameterisation.lo.end(), rest_lo.begin(), rest_lo.end());
+      parameterisation.hi.insert(
+        parameterisation.hi.end(), rest_hi.begin(), rest_hi.end());
       for (std::size_t j = 0; j < parameterisation.lo.size(); ++j) {
         if (!(parameterisation.hi[j] > parameterisation.lo[j])) {
           return false;
@@ -713,15 +739,16 @@ namespace dials { namespace algorithms {
       }
       const std::vector<double>& plo = parameterisation.lo;
       const std::vector<double>& phi = parameterisation.hi;
-      s.alpha = clamp_inside(s.alpha, plo[0], phi[0]);
-      s.beta = clamp_inside(s.beta, plo[1], phi[1]);
-      s.sigma = clamp_inside(s.sigma, plo[2], phi[2]);
-      s.sig_x = clamp_inside(s.sig_x, plo[3], phi[3]);
-      s.sig_y = clamp_inside(s.sig_y, plo[4], phi[4]);
-      s.sig_p = clamp_inside(s.sig_p, plo[5], phi[5]);
-      seed.position.x = clamp_inside(seed.position.x, plo[8], phi[8]);
-      seed.position.y = clamp_inside(seed.position.y, plo[9], phi[9]);
-      seed.position.t = clamp_inside(seed.position.t, plo[10], phi[10]);
+      for (int j = 0; j < n_line; ++j) {
+        s.line.p[j] = clamp_inside(s.line.p[j], plo[j], phi[j]);
+      }
+      s.sig_x = clamp_inside(s.sig_x, plo[n_line], phi[n_line]);
+      s.sig_y = clamp_inside(s.sig_y, plo[n_line + 1], phi[n_line + 1]);
+      s.sig_p = clamp_inside(s.sig_p, plo[n_line + 2], phi[n_line + 2]);
+      seed.position.x = clamp_inside(seed.position.x, plo[n_line + 5], phi[n_line + 5]);
+      seed.position.y = clamp_inside(seed.position.y, plo[n_line + 6], phi[n_line + 6]);
+      seed.position.t = clamp_inside(seed.position.t, plo[n_line + 7], phi[n_line + 7]);
+      parameterisation.fixed_shape = s;
       return true;
     }
 
@@ -837,9 +864,10 @@ namespace dials { namespace algorithms {
           return false;
         }
       }
-      if (detail::at_bound(r.shape.sig_x, lo[3], hi[3])
-          || detail::at_bound(r.shape.sig_y, lo[4], hi[4])
-          || detail::at_bound(r.shape.sig_p, lo[5], hi[5])) {
+      const int k = parameterisation.n_line();
+      if (detail::at_bound(r.shape.sig_x, lo[k], hi[k])
+          || detail::at_bound(r.shape.sig_y, lo[k + 1], hi[k + 1])
+          || detail::at_bound(r.shape.sig_p, lo[k + 2], hi[k + 2])) {
         why = "detector face shape at a bound";
         return false;
       }
@@ -970,7 +998,7 @@ namespace dials { namespace algorithms {
   inline Profile3DShape broaden_profile_3d_shape(const Profile3DShape& shape,
                                                  const Profile3DPosition& scatter) {
     Profile3DShape out = shape;
-    out.sigma = std::sqrt(shape.sigma * shape.sigma + scatter.t * scatter.t);
+    out.line = shape.line.broadened(scatter.t);
     out.sig_x = std::sqrt(shape.sig_x * shape.sig_x + scatter.x * scatter.x);
     out.sig_y = std::sqrt(shape.sig_y * shape.sig_y + scatter.y * scatter.y);
     out.sig_p = shape.sig_p * shape.sig_x * shape.sig_y / (out.sig_x * out.sig_y);
