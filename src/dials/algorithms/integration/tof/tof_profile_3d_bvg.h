@@ -12,7 +12,7 @@
 /*
 Bivariate Gaussian (BVG) spatial model, and supporting geometry/initial-
 estimate helpers, shared by the separable 3D profile fitters (ToF shape ×
-BVG(x,y)), e.g. tof_profile_3d_ic.h and tof_profile_3d_ibix.h.
+BVG(x,y)), and tof_line_shape.h for its Ikeda-Carpenter pulse.
 */
 
 namespace dials { namespace algorithms {

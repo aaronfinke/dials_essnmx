@@ -10,6 +10,7 @@
 #include <dials/array_family/scitbx_shared_and_versa.h>
 #include <random>
 #include "tof_utils.h"
+#include "tof_line_shape.h"
 
 #include <eigen3/Eigen/Dense>
 #include <eigen3/unsupported/Eigen/NonLinearOptimization>
@@ -32,52 +33,14 @@ and reused elsewhere, after Mantid's IntegratePeaksProfileFitting.
 
 namespace dials { namespace algorithms {
 
-  static scitbx::af::shared<double> profile1d_func(scitbx::af::const_ref<double> tof,
-                                                   double A,
-                                                   double alpha,
-                                                   double beta,
-                                                   double sigma,
-                                                   double T_ph) {
-    /*
-     * func used to generate the actual profile
-     * (Numbers) refer to equations in https://doi.org/10.1038/srep36628
-     */
-
-    const size_t m = tof.size();
-    scitbx::af::shared<double> out(m, 0.0);
-
-    double sigma2 = sigma * sigma;
-    double sigma_sqrt = std::sqrt(2.0 * sigma2);
-    double N = (alpha * beta) / (2.0 * (alpha + beta));  // (5)
-
-    for (size_t i = 0; i < m; ++i) {
-      double dT = tof[i] - T_ph;                             // (11)
-      double u = alpha * 0.5 * (alpha * sigma2 + 2.0 * dT);  // (7)
-      double v = beta * 0.5 * (beta * sigma2 - 2.0 * dT);    // (8)
-      double y = (alpha * sigma2 + dT) / sigma_sqrt;         // (9)
-      double z = (beta * sigma2 - dT) / sigma_sqrt;          // (10)
-
-      // Stable evaluation with erfcx
-      double term1 = std::exp(u - y * y) * erfcx_safe(y);
-      double term2 = std::exp(v - z * z) * erfcx_safe(z);
-
-      double val = A * N * (term1 + term2);  // (1)
-      if (!std::isfinite(val)) val = 1e-12;
-      out[i] = val;
-    }
-    return out;
-  }
-
   /*
    * A peak shape, as fitted on one reflection and reusable on another.  Held
    * separately from TOFProfile1DIBIXParams so that a library can be built
    * from many reflections without mutating shared fitting parameters.
    */
-  struct IBIXShape {
-    double alpha = 0.0;
-    double beta = 0.0;
-    double sigma = 0.0;
-    double T_ph = 0.0;  // fitted peak position (us) on the reflection it came from
+  struct ProfileLine {
+    LineShape line;
+    double onset = 0.0;  // fitted onset parameter (us) on the reflection it came from
     bool valid = false;
   };
 
@@ -90,12 +53,6 @@ namespace dials { namespace algorithms {
     double A;
     double A_min;
     double A_max;
-    double alpha;
-    double alpha_min;
-    double alpha_max;
-    double beta;
-    double beta_min;
-    double beta_max;
     int n_restarts;
     bool optimize_profile;
     bool show_profile_failures;
@@ -106,6 +63,17 @@ namespace dials { namespace algorithms {
     double trust_peak_height_fraction;  // Allowed relative error on the peak height
     double library_min_i_sigma;  // Summation I/sigma a shape's reflection must reach
     double library_min_corr;     // Correlation its free fit must reach
+    /*
+     * The line shape fitted, its starting values and bounds, in the order of
+     * LineShape::p. iBIX: alpha and beta (1/us); sigma is taken from the data.
+     * Ikeda-Carpenter: A and B (1/us), R, and the hat half-width and Gaussian
+     * sigma in slices, converted to us on each reflection. A, A_min and A_max
+     * above are the amplitude, for either.
+     */
+    LineShape::Kind line_kind = LineShape::IBIX;
+    std::array<double, 5> line_init = {{0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<double, 5> line_min = {{0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<double, 5> line_max = {{0.0, 0.0, 0.0, 0.0, 0.0}};
     // Measure shapes on strong reflections and fit the rest with them (two
     // passes); without, every reflection is fitted freely on its own
     bool build_library = true;
@@ -130,12 +98,6 @@ namespace dials { namespace algorithms {
         : A(A_min),
           A_min(A_min),
           A_max(A_max),
-          alpha(alpha),
-          alpha_min(alpha_min),
-          alpha_max(alpha_max),
-          beta(beta),
-          beta_min(beta_min),
-          beta_max(beta_max),
           n_restarts(n_restarts),
           optimize_profile(optimize_profile),
           show_profile_failures(show_profile_failures),
@@ -144,7 +106,11 @@ namespace dials { namespace algorithms {
           trust_peak_tolerance(trust_peak_tolerance),
           trust_peak_height_fraction(trust_peak_height_fraction),
           library_min_i_sigma(library_min_i_sigma),
-          library_min_corr(library_min_corr) {}
+          library_min_corr(library_min_corr) {
+      line_init = {{alpha, beta, 0.0, 0.0, 0.0}};
+      line_min = {{alpha_min, beta_min, 0.0, 0.0, 0.0}};
+      line_max = {{alpha_max, beta_max, 0.0, 0.0, 0.0}};
+    }
   };
 
   /*
@@ -157,11 +123,9 @@ namespace dials { namespace algorithms {
    */
   static double analytic_amplitude(scitbx::af::const_ref<double> tof,
                                    scitbx::af::const_ref<double> y_norm,
-                                   double alpha,
-                                   double beta,
-                                   double sigma,
-                                   double T_ph) {
-    scitbx::af::shared<double> g = profile1d_func(tof, 1.0, alpha, beta, sigma, T_ph);
+                                   const LineShape& line,
+                                   double onset) {
+    scitbx::af::shared<double> g = line.evaluate_at_onset(tof, 1.0, onset);
     double num = 0.0, den = 0.0;
     for (std::size_t i = 0; i < g.size(); ++i) {
       if (!is_finite_double(g[i])) {
@@ -221,19 +185,22 @@ namespace dials { namespace algorithms {
   struct IBIXShapeFunctor {
     scitbx::af::const_ref<double> tof;
     scitbx::af::const_ref<double> y_norm;  // Assumed normalized
-    std::array<double, 5> min_bounds;      // parameter bounds
-    std::array<double, 5> max_bounds;      // parameter bounds
+    LineShape::Kind kind;
+    // Parameter bounds: amplitude, the line shape's parameters, onset
+    std::vector<double> min_bounds;
+    std::vector<double> max_bounds;
     int num_data_points, num_params;
 
     IBIXShapeFunctor(scitbx::af::const_ref<double> tof_,
                      scitbx::af::const_ref<double> y_norm_,
-                     const std::array<double, 5>& minb,
-                     const std::array<double, 5>& maxb)
-        : tof(tof_), y_norm(y_norm_) {
-      min_bounds = minb;
-      max_bounds = maxb;
+                     LineShape::Kind kind_,
+                     const std::vector<double>& minb,
+                     const std::vector<double>& maxb)
+        : tof(tof_), y_norm(y_norm_), kind(kind_), min_bounds(minb), max_bounds(maxb) {
       num_data_points = tof.size();
-      num_params = 5;
+      num_params = LineShape::n_params(kind) + 2;
+      DIALS_ASSERT(min_bounds.size() == static_cast<std::size_t>(num_params));
+      DIALS_ASSERT(max_bounds.size() == static_cast<std::size_t>(num_params));
     }
 
     int values() const {
@@ -263,8 +230,13 @@ namespace dials { namespace algorithms {
 
     int operator()(const Eigen::VectorXd& u, Eigen::VectorXd& fvec) const {
       Eigen::VectorXd x = to_params(u);
-      scitbx::af::shared<double> model =
-        profile1d_func(tof, x[0], x[1], x[2], x[3], x[4]);
+      LineShape line;
+      line.kind = kind;
+      const int n = num_params - 2;
+      for (int j = 0; j < n; ++j) {
+        line.p[j] = x[1 + j];
+      }
+      scitbx::af::shared<double> model = line.evaluate_at_onset(tof, x[0], x[n + 1]);
       assert(model.size() == num_data_points);
       for (int i = 0; i < num_data_points; ++i) {
         fvec[i] = y_norm[i] - model[i];
@@ -305,25 +277,17 @@ namespace dials { namespace algorithms {
   struct IBIXForcedFunctor {
     scitbx::af::const_ref<double> tof;
     scitbx::af::const_ref<double> y_norm;  // Assumed normalized
-    double alpha, beta, sigma;             // fixed shape
-    std::array<double, 2> min_bounds;      // bounds on A and T_ph
+    LineShape line;                        // fixed shape
+    std::array<double, 2> min_bounds;      // bounds on A and the onset
     std::array<double, 2> max_bounds;
     int num_data_points, num_params;
 
     IBIXForcedFunctor(scitbx::af::const_ref<double> tof_,
                       scitbx::af::const_ref<double> y_norm_,
-                      double alpha_,
-                      double beta_,
-                      double sigma_,
+                      const LineShape& line_,
                       const std::array<double, 2>& minb,
                       const std::array<double, 2>& maxb)
-        : tof(tof_),
-          y_norm(y_norm_),
-          alpha(alpha_),
-          beta(beta_),
-          sigma(sigma_),
-          min_bounds(minb),
-          max_bounds(maxb) {
+        : tof(tof_), y_norm(y_norm_), line(line_), min_bounds(minb), max_bounds(maxb) {
       num_data_points = tof.size();
       num_params = 2;
     }
@@ -354,8 +318,7 @@ namespace dials { namespace algorithms {
 
     int operator()(const Eigen::VectorXd& u, Eigen::VectorXd& fvec) const {
       Eigen::VectorXd x = to_params(u);
-      scitbx::af::shared<double> model =
-        profile1d_func(tof, x[0], alpha, beta, sigma, x[1]);
+      scitbx::af::shared<double> model = line.evaluate_at_onset(tof, x[0], x[1]);
       for (int i = 0; i < num_data_points; ++i) {
         fvec[i] = y_norm[i] - model[i];
       }
@@ -390,24 +353,31 @@ namespace dials { namespace algorithms {
     double intensity_max;
     int n_restarts;
 
-    // params
-    double A, alpha, beta, sigma, T_ph;
+    // params: amplitude, line shape, onset
+    double A;
+    LineShape line;
+    double T_ph;
     double peak_height_smoothing;
     double trust_min_corr;
     double trust_peak_tolerance;
     double trust_peak_height_fraction;
-    std::array<double, 5> min_bounds;
-    std::array<double, 5> max_bounds;
+    // Bounds on (A, the line shape's parameters, T_ph)
+    std::vector<double> min_bounds;
+    std::vector<double> max_bounds;
 
+    /*
+     * line_init, line_min and line_max as in TOFProfile1DIBIXParams: for
+     * iBIX sigma is taken from the data, for Ikeda-Carpenter the convolution
+     * widths are in slices. T_ph_ is the time of the data's peak.
+     */
     TOFProfile1DIBIX(scitbx::af::const_ref<double> tof_,
                      scitbx::af::const_ref<double> intensities_,
                      double A_,
-                     double alpha_,
-                     double beta_,
+                     const LineShape& line_init,
+                     const LineShape& line_min,
+                     const LineShape& line_max,
                      double T_ph_,
                      const std::array<double, 2> A_bounds,
-                     const std::array<double, 2> alpha_bounds,
-                     const std::array<double, 2> beta_bounds,
                      int n_restarts_,
                      double peak_height_smoothing_,
                      double trust_min_corr_,
@@ -416,9 +386,7 @@ namespace dials { namespace algorithms {
         : tof(tof_),
           intensities(intensities_),
           A(A_),
-          alpha(alpha_),
-          beta(beta_),
-          sigma(1.0),
+          line(line_init),
           T_ph(T_ph_),
           peak_height_smoothing(peak_height_smoothing_),
           trust_min_corr(trust_min_corr_),
@@ -445,30 +413,50 @@ namespace dials { namespace algorithms {
         y_norm[i] = v / intensity_max;
       }
 
-      // Set initial sigma from estimating peak width
-      sigma = estimate_sigma_from_fwhm(tof, y_norm.const_ref());
+      const int n_line = line.n_params();
+      LineShape lo = line_min, hi = line_max;
+      double T_lo = tof.front(), T_hi = tof.back();
+      if (line.kind == LineShape::IBIX) {
+        // Set initial sigma from estimating peak width
+        double sigma = estimate_sigma_from_fwhm(tof, y_norm.const_ref());
+        line.p[2] = sigma;
+        lo.p[2] = sigma / 4.0;
+        hi.p[2] = std::max(100., sigma * 4.0);
+      } else {
+        // Convolution widths from slices to us; the onset before the peak by
+        // the pulse's rise, and allowed well before the box
+        const double dt = n > 1 ? (tof[n - 1] - tof[0]) / (n - 1) : 1.0;
+        for (int j = 3; j < 5; ++j) {
+          line.p[j] *= dt;
+          lo.p[j] *= dt;
+          hi.p[j] *= dt;
+        }
+        for (int j = 0; j < n_line; ++j) {
+          line.p[j] = std::min(std::max(line.p[j], lo.p[j]), hi.p[j]);
+        }
+        T_lo = tof.front() - 2.0 * (tof.back() - tof.front());
+        T_ph = std::min(std::max(T_ph - line.reference_offset(), T_lo), T_hi);
+      }
 
       // Seed the amplitude at its analytic optimum for that shape
-      double A_seed =
-        analytic_amplitude(tof, y_norm.const_ref(), alpha, beta, sigma, T_ph);
+      double A_seed = analytic_amplitude(tof, y_norm.const_ref(), line, T_ph);
       A = std::min(std::max(A_seed, A_bounds[0]), A_bounds[1]);
 
-      // Param bounds (A, alpha, beta, sigma, T_ph)
-      min_bounds = {
-        A_bounds[0], alpha_bounds[0], beta_bounds[0], sigma / 4.0, tof.front()};
-
-      max_bounds = {A_bounds[1],
-                    alpha_bounds[1],
-                    beta_bounds[1],
-                    std::max(100., sigma * 4.0),
-                    tof.back()};
+      min_bounds.push_back(A_bounds[0]);
+      max_bounds.push_back(A_bounds[1]);
+      for (int j = 0; j < n_line; ++j) {
+        min_bounds.push_back(lo.p[j]);
+        max_bounds.push_back(hi.p[j]);
+      }
+      min_bounds.push_back(T_lo);
+      max_bounds.push_back(T_hi);
 
       // Sanity check params
       DIALS_ASSERT(A >= min_bounds[0] && A <= max_bounds[0]);
-      DIALS_ASSERT(alpha >= min_bounds[1] && alpha <= max_bounds[1]);
-      DIALS_ASSERT(beta >= min_bounds[2] && beta <= max_bounds[2]);
-      DIALS_ASSERT(sigma >= min_bounds[3] && sigma <= max_bounds[3]);
-      DIALS_ASSERT(T_ph >= min_bounds[4] && T_ph <= max_bounds[4]);
+      for (int j = 0; j < n_line; ++j) {
+        DIALS_ASSERT(line.p[j] >= min_bounds[1 + j] && line.p[j] <= max_bounds[1 + j]);
+      }
+      DIALS_ASSERT(T_ph >= min_bounds[n_line + 1] && T_ph <= max_bounds[n_line + 1]);
     }
 
     scitbx::af::shared<double> result() const {
@@ -476,7 +464,7 @@ namespace dials { namespace algorithms {
        * Generates (unnormalized) profile for all positions in tof
        */
 
-      scitbx::af::shared<double> m = profile1d_func(tof, A, alpha, beta, sigma, T_ph);
+      scitbx::af::shared<double> m = line.evaluate_at_onset(tof, A, T_ph);
       for (auto& v : m)
         v *= intensity_max;
       return m;
@@ -595,7 +583,7 @@ namespace dials { namespace algorithms {
              double ftol = 1e-8) {
       /*
        * Least-squares minimization
-       * Updates A, alpha, beta, sigma, T_ph
+       * Updates A, the line shape and T_ph
        * If fitting fails, params are perturbed n_restarts to find a solution
        */
 
@@ -603,7 +591,10 @@ namespace dials { namespace algorithms {
       const int ndata = static_cast<int>(tof.size());
       if (ndata < 5) return false;
 
-      IBIXShapeFunctor functor(tof, y_norm.const_ref(), min_bounds, max_bounds);
+      IBIXShapeFunctor functor(
+        tof, y_norm.const_ref(), line.kind, min_bounds, max_bounds);
+      const int n_line = line.n_params();
+      const int n_par = n_line + 2;
       typedef Eigen::LevenbergMarquardt<IBIXShapeFunctor, double> LM;
 
       auto run_single_fit = [&](const Eigen::VectorXd& x_init,
@@ -626,17 +617,21 @@ namespace dials { namespace algorithms {
 
         // Update fitted parameters
         A = x[0];
-        alpha = x[1];
-        beta = x[2];
-        sigma = x[3];
-        T_ph = x[4];
+        for (int j = 0; j < n_line; ++j) {
+          line.p[j] = x[1 + j];
+        }
+        T_ph = x[n_line + 1];
 
         return true;
       };
 
       // First fit attempt
-      Eigen::VectorXd x0(5);
-      x0 << A, alpha, beta, sigma, T_ph;
+      Eigen::VectorXd x0(n_par);
+      x0[0] = A;
+      for (int j = 0; j < n_line; ++j) {
+        x0[1 + j] = line.p[j];
+      }
+      x0[n_line + 1] = T_ph;
       double fit_resid = std::numeric_limits<double>::infinity();
       bool success = run_single_fit(x0, fit_resid);
       std::size_t max_profile_index;
@@ -659,8 +654,8 @@ namespace dials { namespace algorithms {
       std::uniform_real_distribution<double> unit_dist(0.0, 1.0);
 
       for (int i = 0; i < n_restarts; ++i) {
-        Eigen::VectorXd x_try(5);
-        for (int j = 0; j < 5; ++j) {
+        Eigen::VectorXd x_try(n_par);
+        for (int j = 0; j < n_par; ++j) {
           double span = max_bounds[j] - min_bounds[j];
           double rand_frac = (unit_dist(rng) - 0.5) * 0.4;
           double perturbed = x0[j] + rand_frac * span;
@@ -812,7 +807,7 @@ namespace dials { namespace algorithms {
     double& I_prf_out,
     boost::optional<scitbx::af::shared<double>> line_profile_out = boost::none,
     bool update_params = false,
-    IBIXShape* shape_out = nullptr) {
+    ProfileLine* shape_out = nullptr) {
     /**
      * Wrapper for fitting a given reflection
      * If line_profile_out is provided the profile is returned at every
@@ -827,20 +822,20 @@ namespace dials { namespace algorithms {
 
     // Fit profile
     const std::array<double, 2> A_bounds = {profile_params.A_min, profile_params.A_max};
-    const std::array<double, 2> alpha_bounds = {profile_params.alpha_min,
-                                                profile_params.alpha_max};
-    const std::array<double, 2> beta_bounds = {profile_params.beta_min,
-                                               profile_params.beta_max};
+    LineShape line_init, line_min, line_max;
+    line_init.kind = line_min.kind = line_max.kind = profile_params.line_kind;
+    line_init.p = profile_params.line_init;
+    line_min.p = profile_params.line_min;
+    line_max.p = profile_params.line_max;
 
     TOFProfile1DIBIX profile(tof_z,
                              projected_intensity,
                              profile_params.A,
-                             profile_params.alpha,
-                             profile_params.beta,
+                             line_init,
+                             line_min,
+                             line_max,
                              T_ph,
                              A_bounds,
-                             alpha_bounds,
-                             beta_bounds,
                              profile_params.n_restarts,
                              profile_params.peak_height_smoothing,
                              profile_params.trust_min_corr,
@@ -854,15 +849,11 @@ namespace dials { namespace algorithms {
 
     if (profile_success) {
       if (update_params) {
-        profile_params.alpha = profile.alpha;
-        profile_params.beta = profile.beta;
         profile_params.A = profile.A;
       }
       if (shape_out != nullptr) {
-        shape_out->alpha = profile.alpha;
-        shape_out->beta = profile.beta;
-        shape_out->sigma = profile.sigma;
-        shape_out->T_ph = profile.T_ph;
+        shape_out->line = profile.line;
+        shape_out->onset = profile.T_ph;
         shape_out->valid = true;
       }
       double I_prf = profile.calc_intensity();
@@ -897,7 +888,7 @@ namespace dials { namespace algorithms {
   bool fit_profile_1d_ibix_forced(
     scitbx::af::const_ref<double> projected_intensity,
     scitbx::af::const_ref<double> tof_z,
-    const IBIXShape& shape,
+    const ProfileLine& shape,
     double A_min,
     double A_max,
     double& I_prf_out,
@@ -906,7 +897,7 @@ namespace dials { namespace algorithms {
     if (ndata < 5 || !shape.valid) {
       return false;
     }
-    if (!(shape.sigma > 0.0) || !(shape.alpha > 0.0) || !(shape.beta > 0.0)) {
+    if (!shape.line.positive()) {
       return false;
     }
 
@@ -928,25 +919,23 @@ namespace dials { namespace algorithms {
       projected_intensity.begin(),
       std::max_element(projected_intensity.begin(), projected_intensity.end()));
 
-    std::array<double, 2> min_bounds = {A_min, tof_z.front()};
+    // The onset: iBIX's is fitted from the peak itself; an Ikeda-Carpenter
+    // pulse starts its rise before the peak and may start before the box
+    double onset = tof_z[max_index];
+    double onset_min = tof_z.front();
+    if (shape.line.kind == LineShape::IC) {
+      onset_min = tof_z.front() - 2.0 * (tof_z.back() - tof_z.front());
+      onset = std::max(onset - shape.line.reference_offset(), onset_min);
+    }
+    std::array<double, 2> min_bounds = {A_min, onset_min};
     std::array<double, 2> max_bounds = {A_max, tof_z.back()};
 
-    IBIXForcedFunctor functor(tof_z,
-                              y_norm.const_ref(),
-                              shape.alpha,
-                              shape.beta,
-                              shape.sigma,
-                              min_bounds,
-                              max_bounds);
+    IBIXForcedFunctor functor(
+      tof_z, y_norm.const_ref(), shape.line, min_bounds, max_bounds);
 
-    double A_seed = analytic_amplitude(tof_z,
-                                       y_norm.const_ref(),
-                                       shape.alpha,
-                                       shape.beta,
-                                       shape.sigma,
-                                       tof_z[max_index]);
+    double A_seed = analytic_amplitude(tof_z, y_norm.const_ref(), shape.line, onset);
     Eigen::VectorXd x(2);
-    x << std::min(std::max(A_seed, A_min), A_max), tof_z[max_index];
+    x << std::min(std::max(A_seed, A_min), A_max), onset;
 
     Eigen::LevenbergMarquardt<IBIXForcedFunctor, double> lm(functor);
     lm.parameters.maxfev = 200;
@@ -958,8 +947,7 @@ namespace dials { namespace algorithms {
     }
     x = functor.to_params(u);
 
-    scitbx::af::shared<double> model =
-      profile1d_func(tof_z, x[0], shape.alpha, shape.beta, shape.sigma, x[1]);
+    scitbx::af::shared<double> model = shape.line.evaluate_at_onset(tof_z, x[0], x[1]);
     for (auto& v : model) {
       v *= intensity_max;
       if (!is_finite_double(v)) {
