@@ -283,8 +283,9 @@ LIBRARY_METHODS = [
     ("method=profile_3d_ibix", "profile_3d_ibix.library.build=True"),
     ("method=profile_1d_ic", "profile_1d_ic.library.build=True"),
     ("method=profile_3d_ic", "profile_3d_ic.library.build=True"),
+    ("method=profile_3d_gutmann", "profile_3d_gutmann.library.build=True"),
 ]
-LIBRARY_IDS = ["1d_ibix", "3d_ibix", "1d_ic", "3d_ic"]
+LIBRARY_IDS = ["1d_ibix", "3d_ibix", "1d_ic", "3d_ic", "3d_gutmann"]
 
 
 @pytest.mark.parametrize("method", LIBRARY_METHODS, ids=LIBRARY_IDS)

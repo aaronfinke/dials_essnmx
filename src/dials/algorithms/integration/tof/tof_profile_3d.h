@@ -146,7 +146,9 @@ namespace dials { namespace algorithms {
     double sig_x = 0.0;  // detector face (px)
     double sig_y = 0.0;
     double sig_p = 0.0;
-    double drift_x = 0.0;  // movement of the centre with ToF (px/us)
+    // Movement of the face centre with ToF (px/us); for a line shape that
+    // shears (Gutmann), of the ToF centre with position on the face (us/px)
+    double drift_x = 0.0;
     double drift_y = 0.0;
     bool valid = false;
 
@@ -229,8 +231,41 @@ namespace dials { namespace algorithms {
       if (!s.line.positive() || !(s.sig_x > 0.0) || !(s.sig_y > 0.0)) {
         return false;
       }
-      scitbx::af::shared<double> line =
-        s.line.evaluate(scitbx::af::const_ref<double>(d.t.data(), d.t.size()), p.t);
+      const scitbx::af::const_ref<double> t_axis(d.t.data(), d.t.size());
+      if (s.line.shears()) {
+        // Gutmann: the face Gaussian stays at (x, y); the ToF centre of each
+        // pixel's column moves with its position (drift in us/px)
+        double total = 0.0;
+        for (std::size_t ix = 0; ix < d.nx; ++ix) {
+          for (std::size_t iy = 0; iy < d.ny; ++iy) {
+            double f =
+              bvg_func(d.x[ix] - p.x, d.y[iy] - p.y, s.sig_x, s.sig_y, s.sig_p);
+            if (!(f > 0.0)) {
+              continue;
+            }
+            double t_ref =
+              p.t + s.drift_x * (d.x[ix] - p.x) + s.drift_y * (d.y[iy] - p.y);
+            scitbx::af::shared<double> column = s.line.evaluate(t_axis, t_ref);
+            for (std::size_t iz = 0; iz < d.nz; ++iz) {
+              double v = column[iz];
+              if (!std::isfinite(v) || v < 0.0) {
+                continue;
+              }
+              v *= f;
+              out[d.index(ix, iy, iz)] = v;
+              total += v;
+            }
+          }
+        }
+        if (!(total > 0.0) || !std::isfinite(total)) {
+          return false;
+        }
+        for (auto& v : out) {
+          v /= total;
+        }
+        return true;
+      }
+      scitbx::af::shared<double> line = s.line.evaluate(t_axis, p.t);
       for (std::size_t iz = 0; iz < d.nz; ++iz) {
         if (!std::isfinite(line[iz]) || line[iz] < 0.0) {
           line[iz] = 0.0;
@@ -676,7 +711,7 @@ namespace dials { namespace algorithms {
       // The line shape's start and bounds
       LineShape line, line_lo, line_hi;
       line.kind = line_lo.kind = line_hi.kind = params.line_kind;
-      if (params.line_kind == LineShape::IBIX) {
+      if (params.line_kind != LineShape::IC) {
         line.p = {{params.line_init[0], params.line_init[1], sigma0, 0.0, 0.0}};
         line_lo.p = {{params.line_min[0], params.line_min[1], sigma0 / 4.0, 0.0, 0.0}};
         line_hi.p = {{params.line_max[0],
@@ -708,8 +743,14 @@ namespace dials { namespace algorithms {
       seed.position.t = d.t[iz_max];
 
       const double tof_range = d.t.back() - d.t.front() + mean_dt;
-      const double drift_x_max = params.max_drift_factor * d.nx / tof_range;
-      const double drift_y_max = params.max_drift_factor * d.ny / tof_range;
+      // Drift of the face centre with ToF (px/us), or for a shearing line
+      // shape of the ToF centre with position (us/px)
+      const double drift_x_max = s.line.shears()
+                                   ? params.max_drift_factor * tof_range / d.nx
+                                   : params.max_drift_factor * d.nx / tof_range;
+      const double drift_y_max = s.line.shears()
+                                   ? params.max_drift_factor * tof_range / d.ny
+                                   : params.max_drift_factor * d.ny / tof_range;
       parameterisation.free_shape = true;
       parameterisation.fixed_shape = s;
       parameterisation.lo.assign(line_lo.p.begin(), line_lo.p.begin() + n_line);

@@ -416,7 +416,7 @@ namespace dials { namespace algorithms {
       const int n_line = line.n_params();
       LineShape lo = line_min, hi = line_max;
       double T_lo = tof.front(), T_hi = tof.back();
-      if (line.kind == LineShape::IBIX) {
+      if (line.kind != LineShape::IC) {
         // Set initial sigma from estimating peak width
         double sigma = estimate_sigma_from_fwhm(tof, y_norm.const_ref());
         line.p[2] = sigma;

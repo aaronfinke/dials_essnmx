@@ -18,7 +18,6 @@
 #include <scitbx/constants.h>
 #include <dials/model/data/mask_code.h>
 #include <dials/algorithms/integration/tof/tof_profile_1d.h>
-#include <dials/algorithms/integration/tof/tof_profile_3d_gutmann.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d.h>
 #include <dials/algorithms/integration/tof/tof_peak_shape.h>
 #include <dials/algorithms/integration/tof/tof_profile_library.h>
@@ -1329,26 +1328,6 @@ namespace dials { namespace algorithms {
     Library library_;
   };
 
-  class Profile3DGutmannFitter : public ProfileFitter {
-  public:
-    explicit Profile3DGutmannFitter(TOFProfile3DGutmannParams params)
-        : params_(params) {}
-
-    bool fit(const ShoeboxIntegrationResult& shoebox_result,
-             double& I_prf,
-             double& var_prf) override {
-      var_prf = shoebox_result.variance;  // Use summation variance as approximation
-      return fit_profile_3d_gutmann(shoebox_result.coords_3d.const_ref(),
-                                    shoebox_result.intensity_3d,
-                                    shoebox_result.background_var_3d,
-                                    params_,
-                                    I_prf);
-    }
-
-  private:
-    TOFProfile3DGutmannParams params_;
-  };
-
   // Runs incident/empty scanning/smoothing for one shoebox and builds
   // the PixelCorrector
   struct ShoeboxCorrectorInputs {
@@ -1812,104 +1791,11 @@ namespace dials { namespace algorithms {
     return boost::python::make_tuple(I_prf, var_prf, I_sum, var_sum, profile_success);
   }
 
-  // As calculate_line_profile_for_reflection, but also fits a 3D
-  // profile and returns the profile-fitted intensity, the fitted 3D
-  // profile, and the summation results.
-  inline boost::python::tuple calculate_line_profile_for_reflection_3d(
-    dials::af::reflection_table& reflection,
-    Experiment& experiment,
-    ImageSequence& data,
-    boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params,
-    boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params,
-    scitbx::af::shared<double> raw_projected_intensity_out,
-    scitbx::af::shared<double> projected_intensity_out,
-    scitbx::af::shared<double> projected_background_out,
-    scitbx::af::shared<double> tof_z_out,
-    const bool& apply_lorentz_correction,
-    TOFProfile3DGutmannParams& profile_params_3d_gutmann,
-    double lorentz_wavelength_power = 4.0) {
-    DIALS_ASSERT(reflection.size() == 1);
-
-    TOFGeometryContext geometry(experiment, data);
-
-    dials::af::shared<Shoebox<>> shoeboxes = reflection["shoebox"];
-    Shoebox<> shoebox = shoeboxes[0];
-    int6 bbox = shoebox.bbox;
-
-    DIALS_ASSERT(raw_projected_intensity_out.size() == shoebox.zsize());
-    DIALS_ASSERT(projected_intensity_out.size() == shoebox.zsize());
-    DIALS_ASSERT(projected_background_out.size() == shoebox.zsize());
-    DIALS_ASSERT(tof_z_out.size() == shoebox.zsize());
-
-    dials::af::reflection_table i_reflection_table;
-    dials::af::reflection_table e_reflection_table;
-    Shoebox<> i_shoebox, e_shoebox;
-    const Shoebox<>* i_shoebox_ptr = nullptr;
-    const Shoebox<>* e_shoebox_ptr = nullptr;
-    if (incident_params) {
-      i_reflection_table = load_shoebox_image_data(
-        reflection, incident_params->incident_data, geometry.n_panels, data.size());
-      e_reflection_table = load_shoebox_image_data(
-        reflection, incident_params->empty_data, geometry.n_panels, data.size());
-      dials::af::ref<Shoebox<>> i_shoeboxes = i_reflection_table["shoebox"];
-      dials::af::ref<Shoebox<>> e_shoeboxes = e_reflection_table["shoebox"];
-      i_shoebox = i_shoeboxes[0];
-      e_shoebox = e_shoeboxes[0];
-      i_shoebox_ptr = &i_shoebox;
-      e_shoebox_ptr = &e_shoebox;
-    }
-
-    ShoeboxCorrectorInputs inputs = prepare_shoebox_corrector_inputs(
-      shoebox, bbox, geometry.image_size, i_shoebox_ptr, e_shoebox_ptr);
-
-    PixelCorrector corrector(
-      geometry,
-      apply_lorentz_correction,
-      lorentz_wavelength_power,
-      inputs.shoebox_pixel_count.n_signal,
-      inputs.shoebox_pixel_count.n_background,
-      incident_params.get_ptr(),
-      absorption_params.get_ptr(),
-      incident_params ? &inputs.smoothed_incident : nullptr,
-      incident_params ? &inputs.smoothed_empty : nullptr,
-      incident_params ? &inputs.shoebox_pixel_count.n_contrib : nullptr);
-
-    ShoeboxIntegrationResult result = integrate_shoebox(
-      shoebox, bbox, geometry, corrector, inputs.shoebox_pixel_count.success);
-
-    for (std::size_t z = 0; z < shoebox.zsize(); ++z) {
-      raw_projected_intensity_out[z] = result.raw_projected_intensity[z];
-      projected_intensity_out[z] = result.projected_intensity[z];
-      projected_background_out[z] = result.projected_background[z];
-      tof_z_out[z] = result.tof_z[z];
-    }
-
-    double I_prf = 0;
-    double var_prf = 0;
-    bool profile_success = false;
-    scitbx::af::versa<double, scitbx::af::c_grid<3>> profile_3d_out(
-      result.intensity_3d.accessor());
-
-    if (result.success) {
-      profile_success = fit_profile_3d_gutmann(result.coords_3d.const_ref(),
-                                               result.intensity_3d,
-                                               result.background_var_3d,
-                                               profile_params_3d_gutmann,
-                                               I_prf,
-                                               profile_3d_out,
-                                               true);
-    }
-    return boost::python::make_tuple(I_prf,
-                                     var_prf,
-                                     result.intensity,
-                                     result.variance,
-                                     profile_success,
-                                     profile_3d_out);
-  }
-
-  // As calculate_line_profile_for_reflection_3d, but fits the 3D model of
-  // profile_3d_ibix or profile_3d_ic (from the parameters) instead of a
-  // Gutmann profile: the reflection on its own, as without a library.
+  // As calculate_line_profile_for_reflection, but also fits the 3D model of
+  // profile_3d_ibix, profile_3d_ic or profile_3d_gutmann (from the
+  // parameters) to the reflection on its own, as without a library, and
+  // returns the profile-fitted intensity, the fitted 3D profile and the
+  // summation results.
   inline boost::python::tuple calculate_line_profile_for_reflection_3d(
     dials::af::reflection_table& reflection,
     Experiment& experiment,
