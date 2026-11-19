@@ -73,8 +73,11 @@ namespace dials { namespace algorithms {
     double sig_x = 0.0;  // detector face (px)
     double sig_y = 0.0;
     double sig_p = 0.0;
-    double drift_x = 0.0;  // movement of the centre with ToF (px/us), about
-    double drift_y = 0.0;  // its position at the centroid of the line shape
+    // Movement of the face centre with ToF (px/us), about its position at the
+    // line shape's reference time; for a shearing line shape (Gutmann), of
+    // the ToF centre with position on the face (us/px)
+    double drift_x = 0.0;
+    double drift_y = 0.0;
 
     bool box_profile(int x0,
                      int y0,
@@ -91,6 +94,39 @@ namespace dials { namespace algorithms {
       scitbx::af::shared<double> tof_axis(nz);
       for (std::size_t z = 0; z < nz; ++z) {
         tof_axis[z] = tof[z];
+      }
+      if (line.shears()) {
+        // Gutmann: the face Gaussian stays at the centre; the ToF centre of
+        // each pixel's column moves with its position (drift in us/px)
+        profile.assign(nx * ny * nz, 0.0);
+        double norm = 0.0;
+        for (std::size_t ix = 0; ix < nx; ++ix) {
+          for (std::size_t iy = 0; iy < ny; ++iy) {
+            double fx = x0 + ix + 0.5 - centre.x;
+            double fy = y0 + iy + 0.5 - centre.y;
+            double f = bvg_func(fx, fy, sig_x, sig_y, sig_p);
+            if (!(f > 0.0)) {
+              continue;
+            }
+            scitbx::af::shared<double> column = line.evaluate(
+              tof_axis.const_ref(), centre.t + drift_x * fx + drift_y * fy);
+            for (std::size_t z = 0; z < nz; ++z) {
+              double v = column[z];
+              if (!std::isfinite(v) || v < 0.0) {
+                continue;
+              }
+              profile[(ix * ny + iy) * nz + z] = v * f;
+              norm += v * f;
+            }
+          }
+        }
+        if (!(norm > 0.0) || !std::isfinite(norm)) {
+          return false;
+        }
+        for (auto& v : profile) {
+          v /= norm;
+        }
+        return true;
       }
       scitbx::af::shared<double> raw = line.evaluate(tof_axis.const_ref(), centre.t);
       std::vector<double> tof_profile(nz, 0.0);

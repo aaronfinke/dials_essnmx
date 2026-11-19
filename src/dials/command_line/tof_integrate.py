@@ -33,7 +33,6 @@ from dials.util.phil import parse
 from dials.util.version import dials_version
 from dials_algorithms_tof_integration_ext import (
     TOFProfile1DParams,
-    TOFProfile3DGutmannParams,
     TOFProfile3DParams,
     integrate_reflection_table,
     tof_assign_overlap_ownership,
@@ -90,7 +89,8 @@ method = *summation profile_1d_ibix profile_1d_profilelib profile_1d_ic profile_
             "library.build=True and MANDI parameters "
             "profile_1d_ic: Ikeda-Carpenter model, "
             "https://doi.org/10.1016/0168-9002(85)90033-6"
-            "profile_3d_gutmann: https://doi.org/10.1016/j.nima.2016.12.026"
+            "profile_3d_gutmann: back-to-back exponentials convolved with a"
+            "3D Gaussian, https://doi.org/10.1016/j.nima.2016.12.026 "
             "profile_3d_ic: separable Ikeda-Carpenter x bivariate Gaussian model, "
             "https://doi.org/10.1016/0168-9002(85)90033-6"
             "profile_3d_ibix: separable iBIX x bivariate Gaussian model, "
@@ -390,31 +390,114 @@ profile_1d_ic
                     "the library."
     }
 }
-profile_3d_gutmann{
-    init_alpha = 1.0
+profile_3d_gutmann
+    .help = "Gutmann's profile (NIM A 848 (2017) 170): back-to-back"
+            "exponentials in ToF convolved with a 3D Gaussian ellipsoid, with"
+            "the peak centroid fitted. Fitted as the iBIX line shape in ToF,"
+            "integrated exactly over each slice, times a bivariate Gaussian on"
+            "the detector face, with the ToF centre moving linearly with"
+            "position on the face: an exact reparameterisation of the"
+            "ellipsoid. ToF is in us; alpha and beta are rates in 1/us. Eq."
+            "(6) of the paper as printed lacks a 1/H6 in u and v; this is the"
+            "convolution of its eq. (4). With library.build, every parameter"
+            "is fitted on reflections strong enough to determine it, and"
+            "every reflection is fitted with the shape of the nearest of"
+            "those held fixed. The defaults suit a long-pulse source such as"
+            "ISIS SXD."
+{
+    init_alpha = 0.03
         .type = float
-        .help = "Initial alpha value before optimization"
-    init_beta = 0.1
+        .help = "Initial alpha (1/us) of a fit"
+    min_alpha = 0.02
         .type = float
-        .help = "Initial beta value before optimization"
-    min_alpha = 0.5
+        .help = "Min alpha (1/us)"
+    max_alpha = 1.0
         .type = float
-        .help = "Min alpha value for optimization"
-    max_alpha = 20.
+        .help = "Max alpha (1/us)"
+    init_beta = 0.03
         .type = float
-        .help = "Max alpha value for optimization"
-    min_beta = 1e-7
+        .help = "Initial beta (1/us) of a fit"
+    min_beta = 0.0
         .type = float
-        .help = "Min beta value for optimization"
-    max_beta = 5.0
+        .help = "Min beta (1/us)"
+    max_beta = 1.0
         .type = float
-        .help = "Max beta value for optimization"
+        .help = "Max beta (1/us)"
+    min_sig_x = 0.05
+        .type = float
+        .help = "Min bivariate Gaussian sigma x (px)"
+    max_sig_x = 20.0
+        .type = float
+        .help = "Max bivariate Gaussian sigma x (px)"
+    min_sig_y = 0.05
+        .type = float
+        .help = "Min bivariate Gaussian sigma y (px)"
+    max_sig_y = 20.0
+        .type = float
+        .help = "Max bivariate Gaussian sigma y (px)"
+    min_sig_p = -0.99
+        .type = float
+        .help = "Min bivariate Gaussian correlation"
+    max_sig_p = 0.99
+        .type = float
+        .help = "Max bivariate Gaussian correlation"
+    max_drift_factor = 1.5
+        .type = float(value_min=0)
+        .help = "Bound on how fast the ToF centre may move with position on"
+                "the detector: this times the box's extent in ToF over its"
+                "extent in pixels. 0 holds it fixed."
     n_restarts = 100
         .type = int(value_min=0)
-        .help = "If fit fails, number of additional attempts with perturbed params"
-    gradient_method = *forward_difference central_difference
-        .type = choice
-        .help = "Method used to calculate gradients"
+        .help = "If a fit fails, number of further attempts from perturbed"
+                "starting points"
+    min_correlation = 0.75
+        .type = float(value_min=0, value_max=1)
+        .help = "Correlation between model and data over every voxel of the box"
+                "that a reflection fitted on its own must reach to be accepted."
+                "Over its own peak a freely placed model matches a blob of noise"
+                "as well as a weak peak; over the whole box it does not. 0"
+                "disables the test."
+    peak_height_fraction = 0.25
+        .type = float(value_min=0)
+        .help = "Allowed relative difference between the peak height of a"
+                "reflection fitted on its own and the data's tallest voxel. 0"
+                "disables the test."
+    library{
+        build = False
+            .type = bool
+            .help = "Measure the shape on strong reflections, and fit every"
+                    "reflection with the shape of the nearest of those held"
+                    "fixed. Needed for overlaps.mode=deconvolve and"
+                    "overlaps.estimator=joint."
+        min_i_sigma = 10.0
+            .type = float(value_min=0)
+            .help = "Summation I/sigma a reflection must reach for its fitted"
+                    "shape to enter the library. Higher than profile_1d_ibix's,"
+                    "because a 3D shape has eight parameters to determine"
+                    "rather than three."
+        min_correlation = 0.5
+            .type = float(value_min=0, value_max=1)
+            .help = "Correlation over the peak a free fit must reach for its"
+                    "shape to enter the library."
+        free_position_min_i_sigma = 10.0
+            .type = float
+            .help = "A reflection is first fitted at its prediction, corrected"
+                    "by the median offset the library measured on its panel,"
+                    "with only the amplitude free and the shape broadened by how"
+                    "far the library's own peaks scatter about their"
+                    "predictions. A weak peak's counts cannot place it: a"
+                    "position fitted to them finds the brightest noise and reads"
+                    "the intensity high. Where that first fit reaches this"
+                    "I/sigma the position is fitted as well, with the"
+                    "unbroadened shape. Only applies where the table holds"
+                    "predictions (xyzcal.px and tof_cal); otherwise every"
+                    "position is fitted."
+        position_tolerance = 3.0
+            .type = float(value_min=0)
+            .help = "How far a fitted position may move from the expected one:"
+                    "this many times the scatter of the library's own offsets"
+                    "(at least 1 px on the detector and one ToF bin)."
+    }
 }
 profile_3d_ic
     .help = "The Ikeda-Carpenter line shape in ToF times a bivariate Gaussian"
@@ -1086,8 +1169,8 @@ def make_profile_3d_params(
         box_min_correlation = 0.0
         peak_height_fraction = 0.0
     else:
-        name = "profile_3d_ibix"
-        p = params.profile_3d_ibix
+        name = params.method
+        p = getattr(params, name)
         build_library = p.library.build
         # Over the peak, as for the library; over the box, min_correlation
         min_correlation = p.library.min_correlation
@@ -1130,6 +1213,16 @@ def make_profile_3d_params(
             "free_fit_box_min_corr": box_min_correlation,
             "free_fit_peak_height_fraction": peak_height_fraction,
             "build_library": build_library,
+            **(
+                {
+                    "line_kind": "gutmann",
+                    "line_init": [p.init_alpha, p.init_beta, 0.0, 0.0, 0.0],
+                    "line_min": [p.min_alpha, p.min_beta, 0.0, 0.0, 0.0],
+                    "line_max": [p.max_alpha, p.max_beta, 0.0, 0.0, 0.0],
+                }
+                if name == "profile_3d_gutmann"
+                else {}
+            ),
         }
     )
 
@@ -1147,7 +1240,6 @@ def integrate_reflection_table_for_experiment(
     """
     apply_lorentz = params.corrections.lorentz
     profile_1d_params = None
-    profile_3d_gutmann_params = None
     profile_3d_params = None
 
     logger.info(f"    Integrating using {params.method}")
@@ -1158,28 +1250,7 @@ def integrate_reflection_table_for_experiment(
     elif params.method == "profile_1d_ic":
         profile_1d_params = make_profile_1d_params(params, show_profile_failures)
     elif params.method == "profile_3d_gutmann":
-        alpha = params.profile_3d_gutmann.init_alpha
-        beta = params.profile_3d_gutmann.init_beta
-        min_alpha = params.profile_3d_gutmann.min_alpha
-        max_alpha = params.profile_3d_gutmann.max_alpha
-        min_beta = params.profile_3d_gutmann.min_beta
-        max_beta = params.profile_3d_gutmann.max_beta
-        n_restarts = params.profile_3d_gutmann.n_restarts
-        use_central_diff = (
-            params.profile_3d_gutmann.gradient_method == "central_difference"
-        )
-        profile_3d_gutmann_params = TOFProfile3DGutmannParams(
-            alpha,
-            min_alpha,
-            max_alpha,
-            beta,
-            min_beta,
-            max_beta,
-            n_restarts,
-            True,
-            use_central_diff,
-            show_profile_failures,
-        )
+        profile_3d_params = make_profile_3d_params(params, show_profile_failures)
     elif params.method == "profile_3d_ic":
         profile_3d_params = make_profile_3d_params(params, show_profile_failures)
     elif params.method in ("profile_3d_ibix", "profile_3d_profilelib"):
@@ -1203,7 +1274,6 @@ def integrate_reflection_table_for_experiment(
         apply_lorentz,
         params.mp.nproc,
         profile_1d_params,
-        profile_3d_gutmann_params,
         profile_3d_params,
         params.corrections.lorentz_wavelength_power,
     )
@@ -2055,7 +2125,13 @@ def run_integrate(
         "profile_3d_profilelib",
     ) or (
         params.method
-        in ("profile_1d_ibix", "profile_3d_ibix", "profile_1d_ic", "profile_3d_ic")
+        in (
+            "profile_1d_ibix",
+            "profile_3d_ibix",
+            "profile_1d_ic",
+            "profile_3d_ic",
+            "profile_3d_gutmann",
+        )
         and getattr(params, params.method).library.build
     )
     for option, active in (
@@ -2066,7 +2142,8 @@ def run_integrate(
             raise ValueError(
                 f"{option} takes its peak shapes from the profile library, and"
                 " requires a profile method (profile_1d_ibix, profile_3d_ibix,"
-                " profile_1d_ic or profile_3d_ic) with library.build=True"
+                " profile_1d_ic, profile_3d_ic or profile_3d_gutmann) with"
+                " library.build=True"
             )
 
     reflections, _ = process_reference(reflections)

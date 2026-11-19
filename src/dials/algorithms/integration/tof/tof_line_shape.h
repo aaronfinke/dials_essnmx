@@ -242,17 +242,81 @@ namespace dials { namespace algorithms {
     return 0.5 * (lo + hi);
   }
 
+  /*
+   * The integral of the iBIX pulse (unit area, amplitude given) over each
+   * slice of t, for a pulse with onset T_ph: the exact counts per slice of an
+   * exponential-convolved Gaussian, rather than its density at the slice
+   * centre. Slice edges lie halfway between slice centres, so slices of
+   * different widths (logarithmic binning) are each given their own share.
+   *
+   * With N = alpha beta / (2 (alpha + beta)) and tau = t - T_ph, the pulse is
+   * N (e^u erfc(y) + e^v erfc(z)) (profile1d_func) and its antiderivative
+   *   C(tau) = N (e^u erfc(y) / alpha - e^v erfc(z) / beta
+   *               + erf(tau / (sigma sqrt 2)) (1/alpha + 1/beta)),
+   * checked against numerical convolution and integration. e^u erfc(y) is
+   * evaluated as e^(u - y^2) erfcx(y), with u - y^2 = -tau^2 / (2 sigma^2),
+   * where y >= 0, so that it does not overflow.
+   */
+  inline scitbx::af::shared<double> ibix_bin_integrals(scitbx::af::const_ref<double> t,
+                                                       double amplitude,
+                                                       double alpha,
+                                                       double beta,
+                                                       double sigma,
+                                                       double T_ph) {
+    const std::size_t n = t.size();
+    scitbx::af::shared<double> out(n, 0.0);
+    if (n == 0 || !(alpha > 0.0) || !(beta > 0.0) || !(sigma > 0.0)) {
+      return out;
+    }
+    const double s2 = sigma * sigma;
+    const double root2s = sigma * std::sqrt(2.0);
+    const double N = alpha * beta / (2.0 * (alpha + beta));
+    auto exp_erfc = [&](double u, double y, double tau) {
+      return y >= 0.0 ? std::exp(-tau * tau / (2.0 * s2)) * erfcx_safe(y)
+                      : std::exp(std::min(u, 700.0)) * std::erfc(y);
+    };
+    auto C = [&](double time) {
+      const double tau = time - T_ph;
+      const double u = 0.5 * alpha * (alpha * s2 + 2.0 * tau);
+      const double y = (alpha * s2 + tau) / root2s;
+      const double v = 0.5 * beta * (beta * s2 - 2.0 * tau);
+      const double z = (beta * s2 - tau) / root2s;
+      return N
+             * (exp_erfc(u, y, tau) / alpha - exp_erfc(v, z, tau) / beta
+                + std::erf(tau / root2s) * (1.0 / alpha + 1.0 / beta));
+    };
+    for (std::size_t i = 0; i < n; ++i) {
+      double lo, hi;
+      if (n == 1) {
+        lo = t[0] - 0.5;
+        hi = t[0] + 0.5;
+      } else {
+        lo = i == 0 ? t[0] - 0.5 * (t[1] - t[0]) : 0.5 * (t[i - 1] + t[i]);
+        hi =
+          i + 1 == n ? t[n - 1] + 0.5 * (t[n - 1] - t[n - 2]) : 0.5 * (t[i] + t[i + 1]);
+      }
+      double v = amplitude * (C(hi) - C(lo));
+      out[i] = std::isfinite(v) && v > 0.0 ? v : 0.0;
+    }
+    return out;
+  }
+
   struct LineShape {
-    enum Kind { IBIX = 0, IC = 1 };
+    enum Kind { IBIX = 0, IC = 1, GUTMANN = 2 };
     Kind kind = IBIX;
     /*
      * IBIX: alpha (1/us), beta (1/us), sigma (us).
      * IC: A (1/us), B (1/us), R, hat half-width (us), sigma (us).
+     * GUTMANN: as IBIX, integrated over each slice (ibix_bin_integrals): the
+     * ToF part of Gutmann's back-to-back exponentials convolved with a 3D
+     * Gaussian (NIM A 848 (2017) 170, eq. (4); its eq. (6) as printed lacks a
+     * 1/H6 in u and v). In 3D its peak centre moves in ToF with position on
+     * the detector, not the other way round (see Profile3DShape).
      */
     std::array<double, 5> p = {{0.0, 0.0, 0.0, 0.0, 0.0}};
 
     static int n_params(Kind kind) {
-      return kind == IBIX ? 3 : 5;
+      return kind == IC ? 5 : 3;
     }
     int n_params() const {
       return n_params(kind);
@@ -260,7 +324,7 @@ namespace dials { namespace algorithms {
 
     // Index of the Gaussian width, which position errors broaden
     static int width_index(Kind kind) {
-      return kind == IBIX ? 2 : 4;
+      return kind == IC ? 4 : 2;
     }
     int width_index() const {
       return width_index(kind);
@@ -268,7 +332,7 @@ namespace dials { namespace algorithms {
 
     // Every rate and width positive (the hat may be zero)
     bool positive() const {
-      if (kind == IBIX) {
+      if (kind != IC) {
         return p[0] > 0.0 && p[1] > 0.0 && p[2] > 0.0;
       }
       return p[0] > 0.0 && p[1] > 0.0 && p[2] >= 0.0 && p[2] <= 1.0 && p[3] >= 0.0
@@ -277,10 +341,10 @@ namespace dials { namespace algorithms {
 
     /*
      * The reference time minus the onset parameter of the model (T_ph for
-     * iBIX, T0 for Ikeda-Carpenter).
+     * iBIX and Gutmann, T0 for Ikeda-Carpenter).
      */
     double reference_offset() const {
-      if (kind == IBIX) {
+      if (kind != IC) {
         return 1.0 / p[1] - 1.0 / p[0];
       }
       return ic_mode_offset(p[0], p[1], p[2]);
@@ -295,6 +359,9 @@ namespace dials { namespace algorithms {
                                                  double onset) const {
       if (kind == IBIX) {
         return profile1d_func(t, amplitude, p[0], p[1], p[2], onset);
+      }
+      if (kind == GUTMANN) {
+        return ibix_bin_integrals(t, amplitude, p[0], p[1], p[2], onset);
       }
       const std::size_t n = t.size();
       const double dt = n > 1 ? (t[n - 1] - t[0]) / (n - 1) : 1.0;
@@ -331,6 +398,12 @@ namespace dials { namespace algorithms {
       s.kind = IBIX;
       s.p = {{alpha, beta, sigma, 0.0, 0.0}};
       return s;
+    }
+
+    // Whether the ToF centre moves with position on the detector (Gutmann's
+    // 3D Gaussian) rather than the face centre with ToF
+    bool shears() const {
+      return kind == GUTMANN;
     }
   };
 
