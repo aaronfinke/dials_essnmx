@@ -8,6 +8,7 @@
 #include <dials/algorithms/integration/tof/tof_profile_3d_gutmann.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_ic.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_ibix.h>
+#include <dials/algorithms/integration/tof/tof_profile_3d_lp.h>
 #include <dials/algorithms/scaling/tof/tof_scaling.h>
 
 namespace dials { namespace algorithms { namespace boost_python {
@@ -19,12 +20,13 @@ namespace dials { namespace algorithms { namespace boost_python {
     object profile_1d_ic_params_obj,
     object profile_3d_gutmann_params_obj,
     object profile_3d_ic_params_obj,
-    object profile_3d_ibix_params_obj) {
+    object profile_3d_ibix_params_obj,
+    object profile_3d_lp_params_obj) {
     // Only one profile fitting method allowed
     int n_given =
       !profile_1d_ibix_params_obj.is_none() + !profile_1d_ic_params_obj.is_none()
       + !profile_3d_gutmann_params_obj.is_none() + !profile_3d_ic_params_obj.is_none()
-      + !profile_3d_ibix_params_obj.is_none();
+      + !profile_3d_ibix_params_obj.is_none() + !profile_3d_lp_params_obj.is_none();
     DIALS_ASSERT(n_given <= 1);
 
     if (!profile_1d_ibix_params_obj.is_none()) {
@@ -46,6 +48,10 @@ namespace dials { namespace algorithms { namespace boost_python {
     if (!profile_3d_ibix_params_obj.is_none()) {
       return std::make_shared<Profile3DIBIXFitter>(
         extract<TOFProfile3DIBIXParams>(profile_3d_ibix_params_obj));
+    }
+    if (!profile_3d_lp_params_obj.is_none()) {
+      return std::make_shared<Profile3DLPFitter>(
+        extract<TOFProfile3DLPParams>(profile_3d_lp_params_obj));
     }
     return nullptr;
   }
@@ -128,6 +134,164 @@ namespace dials { namespace algorithms { namespace boost_python {
                                                     b("show_profile_failures"));
   }
 
+  std::shared_ptr<TOFProfile3DLPParams> make_TOFProfile3DLPParams(dict params) {
+    auto d = [&](const char* key) { return extract<double>(params[key])(); };
+    auto i = [&](const char* key) { return extract<int>(params[key])(); };
+    auto b = [&](const char* key) { return extract<bool>(params[key])(); };
+    auto d_or = [&](const char* key, double v) {
+      return extract<double>(params.get(key, v))();
+    };
+    auto b_or = [&](const char* key, bool v) {
+      return extract<bool>(params.get(key, v))();
+    };
+    return std::make_shared<TOFProfile3DLPParams>(
+      d("pulse_width"),
+      b("optimize_pulse_width"),
+      d("pulse_width_min_factor"),
+      d("pulse_width_max_factor"),
+      d("tau"),
+      d("tau_min"),
+      d("tau_max"),
+      b("optimize_emission"),
+      d("sigma"),
+      d("sigma_min"),
+      d("sigma_max"),
+      d("SigX_min"),
+      d("SigX_max"),
+      d("SigY_min"),
+      d("SigY_max"),
+      d("SigP"),
+      d("SigP_min"),
+      d("SigP_max"),
+      i("n_restarts"),
+      b("optimize_profile"),
+      d("max_drift_factor"),
+      b("show_profile_failures"),
+      d_or("min_correlation", 0.75),
+      d_or("plateau_height_fraction", 0.25),
+      b_or("library_mode", false),
+      d_or("free_position_min_i_sigma", 10.0),
+      d_or("position_tolerance", 3.0));
+  }
+
+  // Builds the (x, y, z)-ordered 3D arrays the 3D fitters take from flat
+  // arrays in c_grid order, index (ix * ny + iy) * nz + iz
+  template <typename T>
+  scitbx::af::versa<T, af::c_grid<3>> grid_3d(const scitbx::af::const_ref<T>& flat,
+                                              std::size_t nx,
+                                              std::size_t ny,
+                                              std::size_t nz) {
+    DIALS_ASSERT(flat.size() == nx * ny * nz);
+    scitbx::af::versa<T, af::c_grid<3>> out(af::c_grid<3>(nx, ny, nz));
+    for (std::size_t i = 0; i < flat.size(); ++i)
+      out[i] = flat[i];
+    return out;
+  }
+
+  // Fits the long-pulse model to one shoebox given as flat arrays (for
+  // testing and diagnostics). Returns (success, I_prf, var_prf, profile)
+  boost::python::tuple fit_profile_3d_lp_wrapper(
+    scitbx::af::const_ref<vec3<double>> coords,
+    scitbx::af::const_ref<double> intensities,
+    scitbx::af::const_ref<double> background_variances,
+    scitbx::af::const_ref<double> tof_z,
+    std::size_t nx,
+    std::size_t ny,
+    std::size_t nz,
+    TOFProfile3DLPParams& params,
+    scitbx::af::const_ref<double> gains) {
+    scitbx::af::versa<vec3<double>, af::c_grid<3>> c = grid_3d(coords, nx, ny, nz);
+    scitbx::af::versa<double, af::c_grid<3>> I = grid_3d(intensities, nx, ny, nz);
+    scitbx::af::versa<double, af::c_grid<3>> B =
+      grid_3d(background_variances, nx, ny, nz);
+    // No gains given: the intensities are raw counts
+    scitbx::af::versa<double, af::c_grid<3>> G =
+      gains.size() == 0
+        ? scitbx::af::versa<double, af::c_grid<3>>(af::c_grid<3>(nx, ny, nz), 1.0)
+        : grid_3d(gains, nx, ny, nz);
+    scitbx::af::versa<double, af::c_grid<3>> profile(af::c_grid<3>(nx, ny, nz));
+    double I_prf = 0.0, var_prf = 0.0;
+    bool success = fit_profile_3d_lp(
+      c.const_ref(), I, B, G, tof_z, params, I_prf, var_prf, profile, true);
+    scitbx::af::shared<double> profile_flat(profile.begin(), profile.end());
+    return boost::python::make_tuple(success, I_prf, var_prf, profile_flat);
+  }
+
+  // Fits one shoebox, given as flat arrays, with a library shape (for testing
+  // and diagnostics). shape holds W, tau, sigma, sig_x, sig_y, sig_p, dxdt,
+  // dydt, expected (x, y, t) and scatter (x, y, t). Returns (success, I_prf,
+  // var_prf, position_free, fitted centre)
+  boost::python::tuple fit_profile_3d_lp_library_wrapper(
+    scitbx::af::const_ref<vec3<double>> coords,
+    scitbx::af::const_ref<double> intensities,
+    scitbx::af::const_ref<double> background_variances,
+    scitbx::af::const_ref<double> tof_z,
+    std::size_t nx,
+    std::size_t ny,
+    std::size_t nz,
+    const TOFProfile3DLPParams& params,
+    dict shape,
+    scitbx::af::const_ref<double> gains) {
+    auto d = [&](const char* key) { return extract<double>(shape[key])(); };
+    auto v = [&](const char* key) { return extract<vec3<double>>(shape[key])(); };
+    LPLibraryShape lib;
+    lib.W = d("W");
+    lib.tau = d("tau");
+    lib.sigma = d("sigma");
+    lib.SigX = d("sig_x");
+    lib.SigY = d("sig_y");
+    lib.SigP = d("sig_p");
+    lib.dXdt = d("dxdt");
+    lib.dYdt = d("dydt");
+    const vec3<double> e = v("expected");
+    const vec3<double> sc = v("scatter");
+    lib.expected_x = e[0];
+    lib.expected_y = e[1];
+    lib.expected_t = e[2];
+    lib.scatter_x = sc[0];
+    lib.scatter_y = sc[1];
+    lib.scatter_t = sc[2];
+
+    scitbx::af::versa<vec3<double>, af::c_grid<3>> c = grid_3d(coords, nx, ny, nz);
+    scitbx::af::versa<double, af::c_grid<3>> I = grid_3d(intensities, nx, ny, nz);
+    scitbx::af::versa<double, af::c_grid<3>> B =
+      grid_3d(background_variances, nx, ny, nz);
+    scitbx::af::versa<double, af::c_grid<3>> G =
+      gains.size() == 0
+        ? scitbx::af::versa<double, af::c_grid<3>>(af::c_grid<3>(nx, ny, nz), 1.0)
+        : grid_3d(gains, nx, ny, nz);
+    double I_prf = 0.0, var_prf = 0.0;
+    LPFitResult result;
+    bool success = fit_profile_3d_lp_library(
+      c.const_ref(), I, B, G, tof_z, params, lib, I_prf, var_prf, boost::none, &result);
+    return boost::python::make_tuple(
+      success,
+      I_prf,
+      var_prf,
+      result.position_free,
+      vec3<double>(result.centre_x, result.centre_y, result.centre_t));
+  }
+
+  // As fit_profile_3d_lp_wrapper, for the Ikeda-Carpenter model. coords z
+  // must be in frames, as integrate_shoebox fills them. Returns
+  // (success, I_prf)
+  boost::python::tuple fit_profile_3d_ic_wrapper(
+    scitbx::af::const_ref<vec3<double>> coords,
+    scitbx::af::const_ref<double> intensities,
+    scitbx::af::const_ref<double> background_variances,
+    std::size_t nx,
+    std::size_t ny,
+    std::size_t nz,
+    TOFProfile3DICParams& params) {
+    scitbx::af::versa<vec3<double>, af::c_grid<3>> c = grid_3d(coords, nx, ny, nz);
+    scitbx::af::versa<double, af::c_grid<3>> I = grid_3d(intensities, nx, ny, nz);
+    scitbx::af::versa<double, af::c_grid<3>> B =
+      grid_3d(background_variances, nx, ny, nz);
+    double I_prf = 0.0;
+    bool success = fit_profile_3d_ic(c.const_ref(), I, B, params, I_prf);
+    return boost::python::make_tuple(success, I_prf);
+  }
+
   void integrate_reflection_table_wrapper(dials::af::reflection_table& reflection_table,
                                           dxtbx::model::Experiment& experiment,
                                           dxtbx::ImageSequence& data,
@@ -139,7 +303,8 @@ namespace dials { namespace algorithms { namespace boost_python {
                                           object profile_1d_ic_params_obj,
                                           object profile_3d_gutmann_params_obj,
                                           object profile_3d_ic_params_obj,
-                                          object profile_3d_ibix_params_obj) {
+                                          object profile_3d_ibix_params_obj,
+                                          object profile_3d_lp_params_obj) {
     boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
     boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params;
 
@@ -157,7 +322,8 @@ namespace dials { namespace algorithms { namespace boost_python {
                           profile_1d_ic_params_obj,
                           profile_3d_gutmann_params_obj,
                           profile_3d_ic_params_obj,
-                          profile_3d_ibix_params_obj);
+                          profile_3d_ibix_params_obj,
+                          profile_3d_lp_params_obj);
 
     integrate_reflection_table(reflection_table,
                                experiment,
@@ -366,6 +532,36 @@ namespace dials { namespace algorithms { namespace boost_python {
                                                     profile_params_3d_ibix);
   }
 
+  boost::python::tuple calculate_line_profile_for_reflection_3d_lp_wrapper(
+    dials::af::reflection_table& reflection,
+    dxtbx::model::Experiment& experiment,
+    dxtbx::ImageSequence& data,
+    object incident_params_obj,
+    object absorption_params_obj,
+    scitbx::af::shared<double> raw_projected_intensity_out,
+    scitbx::af::shared<double> projected_intensity_out,
+    scitbx::af::shared<double> projected_background_out,
+    scitbx::af::shared<double> tof_z_out,
+    const bool& apply_lorentz_correction,
+    TOFProfile3DLPParams& profile_params_3d_lp) {
+    boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params;
+    boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params;
+    extract_correction_params(
+      incident_params_obj, absorption_params_obj, incident_params, absorption_params);
+
+    return calculate_line_profile_for_reflection_3d(reflection,
+                                                    experiment,
+                                                    data,
+                                                    incident_params,
+                                                    absorption_params,
+                                                    raw_projected_intensity_out,
+                                                    projected_intensity_out,
+                                                    projected_background_out,
+                                                    tof_z_out,
+                                                    apply_lorentz_correction,
+                                                    profile_params_3d_lp);
+  }
+
   BOOST_PYTHON_MODULE(dials_algorithms_tof_integration_ext) {
     class_<TOFProfile1DIBIXParams>("TOFProfile1DIBIXParams", no_init)
       .def(init<double,
@@ -478,6 +674,84 @@ namespace dials { namespace algorithms { namespace boost_python {
       .def_readwrite("show_profile_failures",
                      &TOFProfile3DIBIXParams::show_profile_failures);
 
+    class_<TOFProfile3DLPParams, std::shared_ptr<TOFProfile3DLPParams>>(
+      "TOFProfile3DLPParams", no_init)
+      .def("__init__", make_constructor(&make_TOFProfile3DLPParams))
+      .def_readwrite("pulse_width", &TOFProfile3DLPParams::pulse_width)
+      .def_readwrite("optimize_pulse_width",
+                     &TOFProfile3DLPParams::optimize_pulse_width)
+      .def_readwrite("pulse_width_min_factor",
+                     &TOFProfile3DLPParams::pulse_width_min_factor)
+      .def_readwrite("pulse_width_max_factor",
+                     &TOFProfile3DLPParams::pulse_width_max_factor)
+      .def_readwrite("tau", &TOFProfile3DLPParams::tau)
+      .def_readwrite("tau_min", &TOFProfile3DLPParams::tau_min)
+      .def_readwrite("tau_max", &TOFProfile3DLPParams::tau_max)
+      .def_readwrite("optimize_emission", &TOFProfile3DLPParams::optimize_emission)
+      .def_readwrite("sigma", &TOFProfile3DLPParams::sigma)
+      .def_readwrite("sigma_min", &TOFProfile3DLPParams::sigma_min)
+      .def_readwrite("sigma_max", &TOFProfile3DLPParams::sigma_max)
+      .def_readwrite("SigX_min", &TOFProfile3DLPParams::SigX_min)
+      .def_readwrite("SigX_max", &TOFProfile3DLPParams::SigX_max)
+      .def_readwrite("SigY_min", &TOFProfile3DLPParams::SigY_min)
+      .def_readwrite("SigY_max", &TOFProfile3DLPParams::SigY_max)
+      .def_readwrite("SigP", &TOFProfile3DLPParams::SigP)
+      .def_readwrite("SigP_min", &TOFProfile3DLPParams::SigP_min)
+      .def_readwrite("SigP_max", &TOFProfile3DLPParams::SigP_max)
+      .def_readwrite("n_restarts", &TOFProfile3DLPParams::n_restarts)
+      .def_readwrite("optimize_profile", &TOFProfile3DLPParams::optimize_profile)
+      .def_readwrite("max_drift_factor", &TOFProfile3DLPParams::max_drift_factor)
+      .def_readwrite("show_profile_failures",
+                     &TOFProfile3DLPParams::show_profile_failures)
+      .def_readwrite("min_correlation", &TOFProfile3DLPParams::min_correlation)
+      .def_readwrite("plateau_height_fraction",
+                     &TOFProfile3DLPParams::plateau_height_fraction)
+      .def_readwrite("library_mode", &TOFProfile3DLPParams::library_mode)
+      .def_readwrite("free_position_min_i_sigma",
+                     &TOFProfile3DLPParams::free_position_min_i_sigma)
+      .def_readwrite("position_tolerance", &TOFProfile3DLPParams::position_tolerance);
+
+    def("tof_long_pulse_line_shape",
+        &lp_raw,
+        (arg("tof"), arg("T0"), arg("W"), arg("tau"), arg("sigma")));
+
+    def("tof_emg_cdf", &lp_emg_cdf, (arg("t"), arg("tau"), arg("sigma")));
+
+    def("fit_profile_3d_lp",
+        &fit_profile_3d_lp_wrapper,
+        (arg("coords"),
+         arg("intensities"),
+         arg("background_variances"),
+         arg("tof_z"),
+         arg("nx"),
+         arg("ny"),
+         arg("nz"),
+         arg("params"),
+         arg("gains") = scitbx::af::shared<double>()));
+
+    def("fit_profile_3d_lp_library",
+        &fit_profile_3d_lp_library_wrapper,
+        (arg("coords"),
+         arg("intensities"),
+         arg("background_variances"),
+         arg("tof_z"),
+         arg("nx"),
+         arg("ny"),
+         arg("nz"),
+         arg("params"),
+         arg("shape"),
+         arg("gains") = scitbx::af::shared<double>()));
+
+    def("fit_profile_3d_ic",
+        &fit_profile_3d_ic_wrapper,
+        (arg("coords"),
+         arg("intensities"),
+         arg("background_variances"),
+         arg("nx"),
+         arg("ny"),
+         arg("nz"),
+         arg("params")));
+
     def("tof_calculate_ellipse_shoebox_mask",
         &tof_calculate_ellipse_shoebox_mask,
         (arg("reflection_table"),
@@ -506,7 +780,8 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("profile_1d_ic_params") = object(),
          arg("profile_3d_gutmann_params") = object(),
          arg("profile_3d_ic_params") = object(),
-         arg("profile_3d_ibix_params") = object()));
+         arg("profile_3d_ibix_params") = object(),
+         arg("profile_3d_lp_params") = object()));
 
     def("calculate_line_profile_for_reflection",
         &calculate_line_profile_for_reflection_wrapper,
@@ -592,6 +867,20 @@ namespace dials { namespace algorithms { namespace boost_python {
          arg("tof_z_out"),
          arg("apply_lorentz_correction"),
          arg("profile_params_3d_ibix")));
+
+    def("calculate_line_profile_for_reflection_3d",
+        &calculate_line_profile_for_reflection_3d_lp_wrapper,
+        (arg("reflection"),
+         arg("experiment"),
+         arg("data"),
+         arg("incident_params"),
+         arg("absorption_params"),
+         arg("raw_projected_intensity_out"),
+         arg("projected_intensity_out"),
+         arg("projected_background_out"),
+         arg("tof_z_out"),
+         arg("apply_lorentz_correction"),
+         arg("profile_params_3d_lp")));
   }
 
 }}}  // namespace dials::algorithms::boost_python

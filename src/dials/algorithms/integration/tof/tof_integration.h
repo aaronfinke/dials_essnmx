@@ -22,6 +22,7 @@
 #include <dials/algorithms/integration/tof/tof_profile_3d_gutmann.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_ic.h>
 #include <dials/algorithms/integration/tof/tof_profile_3d_ibix.h>
+#include <dials/algorithms/integration/tof/tof_profile_3d_lp.h>
 #include <dials/algorithms/scaling/tof/tof_scaling.h>
 #include <dials/util/thread_pool.h>
 
@@ -188,6 +189,7 @@ namespace dials { namespace algorithms {
     double var_I = 0;
     double var_B = 0;
     double I_raw = 0;
+    double gain = 1;  // corrected intensity per raw count
   };
 
   class PixelCorrector {
@@ -269,6 +271,8 @@ namespace dials { namespace algorithms {
       double I0, var_I0, I_raw, B, var_B_pre;
       double J = 1.0, var_J = 0.0;
 
+      double count_scale = 1.0;  // I0 per raw count
+
       // Bin-width normalisation is applied to the incident spectrum
       if (!has_incident) {
         I0 = raw_S - raw_B;
@@ -280,6 +284,7 @@ namespace dials { namespace algorithms {
         double bin_width =
           frame_z > 0 ? geometry_.img_tof[frame_z] - geometry_.img_tof[frame_z - 1]
                       : geometry_.img_tof[1] - geometry_.img_tof[0];
+        count_scale = 1.0 / incident_params_->sample_proton_charge;
         double n = double((*n_contrib_)[z]);
         double raw_J = (*smoothed_incident_)[z] / n;
         double raw_E = (*smoothed_empty_)[z] / n;
@@ -335,6 +340,7 @@ namespace dials { namespace algorithms {
         (L * L / (JT * JT)) * var_I0 + (L * L * I0 * I0 / (JT * JT * J * J)) * var_J;
       out.var_B =
         (L * L / (JT * JT)) * var_B_pre + (L * L * B * B / (JT * JT * J * J)) * var_J;
+      out.gain = L * count_scale / JT;
       return true;
     }
 
@@ -360,6 +366,9 @@ namespace dials { namespace algorithms {
     scitbx::af::shared<double> projected_background;
     scitbx::af::versa<double, af::c_grid<3>> intensity_3d;
     scitbx::af::versa<double, af::c_grid<3>> background_var_3d;
+    // Corrected intensity per raw count, per voxel: the scale that turns
+    // counting statistics into the variance of intensity_3d
+    scitbx::af::versa<double, af::c_grid<3>> gain_3d;
     scitbx::af::versa<vec3<double>, af::c_grid<3>> coords_3d;
   };
 
@@ -382,6 +391,7 @@ namespace dials { namespace algorithms {
     af::c_grid<3> transposed_acc(acc[2], acc[1], acc[0]);
     result.intensity_3d = scitbx::af::versa<double, af::c_grid<3>>(transposed_acc);
     result.background_var_3d = scitbx::af::versa<double, af::c_grid<3>>(transposed_acc);
+    result.gain_3d = scitbx::af::versa<double, af::c_grid<3>>(transposed_acc, 1.0);
     result.coords_3d = scitbx::af::versa<vec3<double>, af::c_grid<3>>(transposed_acc);
 
     int panel = shoebox.panel;
@@ -427,6 +437,7 @@ namespace dials { namespace algorithms {
 
           result.intensity_3d(x, y, z) = pixel.I;
           result.background_var_3d(x, y, z) = pixel.var_B;
+          result.gain_3d(x, y, z) = pixel.gain;
           double x_c = x + shoebox.xoffset() + 0.5;
           double y_c = y + shoebox.yoffset() + 0.5;
           double z_c = z + shoebox.zoffset() + 0.5;
@@ -459,6 +470,21 @@ namespace dials { namespace algorithms {
     virtual bool fit(const ShoeboxIntegrationResult& shoebox_result,
                      double& I_prf,
                      double& var_prf) = 0;
+
+    // Fits reflection i of the table given to prepare. Fitters that keep
+    // per-reflection inputs or outputs override this; it is called from
+    // several threads, each with its own i.
+    virtual bool fit(std::size_t /*i*/,
+                     const ShoeboxIntegrationResult& shoebox_result,
+                     double& I_prf,
+                     double& var_prf) {
+      return fit(shoebox_result, I_prf, var_prf);
+    }
+
+    // Called once before the first fit, to read per-reflection inputs, and
+    // once after the last, to write per-reflection outputs
+    virtual void prepare(dials::af::reflection_table& /*reflection_table*/) {}
+    virtual void finish(dials::af::reflection_table& /*reflection_table*/) {}
   };
 
   class Profile1DIBIXFitter : public ProfileFitter {
@@ -553,6 +579,172 @@ namespace dials { namespace algorithms {
 
   private:
     TOFProfile3DIBIXParams params_;
+  };
+
+  /*
+   * Long-pulse profile fitting. Free fits by default; with library_mode, each
+   * reflection is fitted with the library shape given in its lp_library.*
+   * columns (set by dials.tof_integrate from a first, free pass), and those
+   * without a valid one are not profile fitted. Either way the fitted shape,
+   * absolute centre and projection correlations are written to profile.lp.*
+   * columns, NaN where there was no fit.
+   */
+  class Profile3DLPFitter : public ProfileFitter {
+  public:
+    explicit Profile3DLPFitter(TOFProfile3DLPParams params) : params_(params) {}
+
+    bool fit(const ShoeboxIntegrationResult& shoebox_result,
+             double& I_prf,
+             double& var_prf) override {
+      // The variance is propagated from the fit, not copied from summation
+      return fit_profile_3d_lp(shoebox_result.coords_3d.const_ref(),
+                               shoebox_result.intensity_3d,
+                               shoebox_result.background_var_3d,
+                               shoebox_result.gain_3d,
+                               shoebox_result.tof_z.const_ref(),
+                               params_,
+                               I_prf,
+                               var_prf);
+    }
+
+    bool fit(std::size_t i,
+             const ShoeboxIntegrationResult& shoebox_result,
+             double& I_prf,
+             double& var_prf) override {
+      LPFitResult result;
+      bool ok = false;
+      if (params_.library_mode) {
+        if (!library_valid_[i]) return false;
+        ok = fit_profile_3d_lp_library(shoebox_result.coords_3d.const_ref(),
+                                       shoebox_result.intensity_3d,
+                                       shoebox_result.background_var_3d,
+                                       shoebox_result.gain_3d,
+                                       shoebox_result.tof_z.const_ref(),
+                                       params_,
+                                       library_[i],
+                                       I_prf,
+                                       var_prf,
+                                       boost::none,
+                                       &result);
+      } else {
+        ok = fit_profile_3d_lp(shoebox_result.coords_3d.const_ref(),
+                               shoebox_result.intensity_3d,
+                               shoebox_result.background_var_3d,
+                               shoebox_result.gain_3d,
+                               shoebox_result.tof_z.const_ref(),
+                               params_,
+                               I_prf,
+                               var_prf,
+                               boost::none,
+                               false,
+                               &result);
+      }
+      if (ok) {
+        results_[i] = result;
+        fitted_[i] = 1;
+      }
+      return ok;
+    }
+
+    void prepare(dials::af::reflection_table& table) override {
+      const std::size_t n = table.size();
+      results_.assign(n, LPFitResult());
+      fitted_.assign(n, 0);
+      if (!params_.library_mode) return;
+      static const char* required[] = {"lp_library.valid",
+                                       "lp_library.W",
+                                       "lp_library.tau",
+                                       "lp_library.sigma",
+                                       "lp_library.sig_x",
+                                       "lp_library.sig_y",
+                                       "lp_library.sig_p",
+                                       "lp_library.dxdt",
+                                       "lp_library.dydt",
+                                       "lp_library.expected",
+                                       "lp_library.scatter"};
+      for (const char* name : required) {
+        DIALS_ASSERT(table.contains(name));
+      }
+      dials::af::const_ref<bool> valid = table["lp_library.valid"];
+      dials::af::const_ref<double> W = table["lp_library.W"];
+      dials::af::const_ref<double> tau = table["lp_library.tau"];
+      dials::af::const_ref<double> sigma = table["lp_library.sigma"];
+      dials::af::const_ref<double> sig_x = table["lp_library.sig_x"];
+      dials::af::const_ref<double> sig_y = table["lp_library.sig_y"];
+      dials::af::const_ref<double> sig_p = table["lp_library.sig_p"];
+      dials::af::const_ref<double> dxdt = table["lp_library.dxdt"];
+      dials::af::const_ref<double> dydt = table["lp_library.dydt"];
+      dials::af::const_ref<vec3<double>> expected = table["lp_library.expected"];
+      dials::af::const_ref<vec3<double>> scatter = table["lp_library.scatter"];
+      library_.assign(n, LPLibraryShape());
+      library_valid_.assign(n, 0);
+      for (std::size_t i = 0; i < n; ++i) {
+        library_valid_[i] = valid[i] ? 1 : 0;
+        LPLibraryShape& l = library_[i];
+        l.W = W[i];
+        l.tau = tau[i];
+        l.sigma = sigma[i];
+        l.SigX = sig_x[i];
+        l.SigY = sig_y[i];
+        l.SigP = sig_p[i];
+        l.dXdt = dxdt[i];
+        l.dYdt = dydt[i];
+        l.expected_x = expected[i][0];
+        l.expected_y = expected[i][1];
+        l.expected_t = expected[i][2];
+        l.scatter_x = scatter[i][0];
+        l.scatter_y = scatter[i][1];
+        l.scatter_t = scatter[i][2];
+      }
+    }
+
+    void finish(dials::af::reflection_table& table) override {
+      const std::size_t n = table.size();
+      const double nan = std::numeric_limits<double>::quiet_NaN();
+      dials::af::shared<double> W(n, nan), tau(n, nan), sigma(n, nan);
+      dials::af::shared<double> sig_x(n, nan), sig_y(n, nan), sig_p(n, nan);
+      dials::af::shared<double> dxdt(n, nan), dydt(n, nan);
+      dials::af::shared<double> cc_tof(n, nan), cc_xy(n, nan);
+      dials::af::shared<vec3<double>> centre(n, vec3<double>(nan, nan, nan));
+      dials::af::shared<bool> position_free(n, false);
+      for (std::size_t i = 0; i < n && i < fitted_.size(); ++i) {
+        if (!fitted_[i]) continue;
+        const LPFitResult& r = results_[i];
+        W[i] = r.W;
+        tau[i] = r.tau;
+        sigma[i] = r.sigma;
+        sig_x[i] = r.SigX;
+        sig_y[i] = r.SigY;
+        sig_p[i] = r.SigP;
+        dxdt[i] = r.dXdt;
+        dydt[i] = r.dYdt;
+        cc_tof[i] = r.cc_tof;
+        cc_xy[i] = r.cc_xy;
+        centre[i] = vec3<double>(r.centre_x, r.centre_y, r.centre_t);
+        position_free[i] = r.position_free;
+      }
+      table["profile.lp.W"] = W;
+      table["profile.lp.tau"] = tau;
+      table["profile.lp.sigma"] = sigma;
+      table["profile.lp.sig_x"] = sig_x;
+      table["profile.lp.sig_y"] = sig_y;
+      table["profile.lp.sig_p"] = sig_p;
+      table["profile.lp.dxdt"] = dxdt;
+      table["profile.lp.dydt"] = dydt;
+      table["profile.lp.cc_tof"] = cc_tof;
+      table["profile.lp.cc_xy"] = cc_xy;
+      table["profile.lp.centre"] = centre;
+      table["profile.lp.position_free"] = position_free;
+    }
+
+  private:
+    TOFProfile3DLPParams params_;
+    std::vector<LPFitResult> results_;
+    // char, not bool: std::vector<bool> packs bits, so writes to distinct i
+    // from several threads would race
+    std::vector<char> fitted_;
+    std::vector<LPLibraryShape> library_;
+    std::vector<char> library_valid_;
   };
 
   // Runs incident/empty scanning/smoothing for one shoebox and builds
@@ -680,7 +872,7 @@ namespace dials { namespace algorithms {
           bool profile_success = false;
           double I_prf = 0.0, var_prf = 0.0;
           if (shoebox_result.success) {
-            profile_success = profile_fitter->fit(shoebox_result, I_prf, var_prf);
+            profile_success = profile_fitter->fit(i, shoebox_result, I_prf, var_prf);
           }
           if (profile_success) {
             intensities_prf[i] = I_prf;
@@ -690,6 +882,10 @@ namespace dials { namespace algorithms {
         }
       }
     };
+
+    if (profile_fitter) {
+      profile_fitter->prepare(reflection_table);
+    }
 
     dials::util::ThreadPool pool(n_threads);
     std::size_t chunk_size = (n_reflections + n_threads - 1) / n_threads;
@@ -703,6 +899,10 @@ namespace dials { namespace algorithms {
     }
 
     pool.wait();
+
+    if (profile_fitter) {
+      profile_fitter->finish(reflection_table);
+    }
 
     reflection_table["intensity.sum.value"] = intensities;
     reflection_table["intensity.sum.variance"] = variances;
@@ -1172,6 +1372,102 @@ namespace dials { namespace algorithms {
                                             I_prf,
                                             profile_3d_out,
                                             true);
+    }
+    return boost::python::make_tuple(I_prf,
+                                     var_prf,
+                                     result.intensity,
+                                     result.variance,
+                                     profile_success,
+                                     profile_3d_out);
+  }
+
+  // As calculate_line_profile_for_reflection_3d, but fits the 3D
+  // long-pulse profile. The fitted ToF-shape parameters are written back to
+  // profile_params_3d_lp.
+  inline boost::python::tuple calculate_line_profile_for_reflection_3d(
+    dials::af::reflection_table& reflection,
+    Experiment& experiment,
+    ImageSequence& data,
+    boost::optional<dials_scaling::TOFIncidentSpectrumParams> incident_params,
+    boost::optional<dials_scaling::TOFAbsorptionParams> absorption_params,
+    scitbx::af::shared<double> raw_projected_intensity_out,
+    scitbx::af::shared<double> projected_intensity_out,
+    scitbx::af::shared<double> projected_background_out,
+    scitbx::af::shared<double> tof_z_out,
+    const bool& apply_lorentz_correction,
+    TOFProfile3DLPParams& profile_params_3d_lp) {
+    DIALS_ASSERT(reflection.size() == 1);
+
+    TOFGeometryContext geometry(experiment, data);
+
+    dials::af::shared<Shoebox<>> shoeboxes = reflection["shoebox"];
+    Shoebox<> shoebox = shoeboxes[0];
+    int6 bbox = shoebox.bbox;
+
+    DIALS_ASSERT(raw_projected_intensity_out.size() == shoebox.zsize());
+    DIALS_ASSERT(projected_intensity_out.size() == shoebox.zsize());
+    DIALS_ASSERT(projected_background_out.size() == shoebox.zsize());
+    DIALS_ASSERT(tof_z_out.size() == shoebox.zsize());
+
+    dials::af::reflection_table i_reflection_table;
+    dials::af::reflection_table e_reflection_table;
+    Shoebox<> i_shoebox, e_shoebox;
+    const Shoebox<>* i_shoebox_ptr = nullptr;
+    const Shoebox<>* e_shoebox_ptr = nullptr;
+    if (incident_params) {
+      i_reflection_table = load_shoebox_image_data(
+        reflection, incident_params->incident_data, geometry.n_panels, data.size());
+      e_reflection_table = load_shoebox_image_data(
+        reflection, incident_params->empty_data, geometry.n_panels, data.size());
+      dials::af::ref<Shoebox<>> i_shoeboxes = i_reflection_table["shoebox"];
+      dials::af::ref<Shoebox<>> e_shoeboxes = e_reflection_table["shoebox"];
+      i_shoebox = i_shoeboxes[0];
+      e_shoebox = e_shoeboxes[0];
+      i_shoebox_ptr = &i_shoebox;
+      e_shoebox_ptr = &e_shoebox;
+    }
+
+    ShoeboxCorrectorInputs inputs = prepare_shoebox_corrector_inputs(
+      shoebox, bbox, geometry.image_size, i_shoebox_ptr, e_shoebox_ptr);
+
+    PixelCorrector corrector(
+      geometry,
+      apply_lorentz_correction,
+      inputs.shoebox_pixel_count.n_signal,
+      inputs.shoebox_pixel_count.n_background,
+      incident_params.get_ptr(),
+      absorption_params.get_ptr(),
+      incident_params ? &inputs.smoothed_incident : nullptr,
+      incident_params ? &inputs.smoothed_empty : nullptr,
+      incident_params ? &inputs.shoebox_pixel_count.n_contrib : nullptr);
+
+    ShoeboxIntegrationResult result = integrate_shoebox(
+      shoebox, bbox, geometry, corrector, inputs.shoebox_pixel_count.success);
+
+    for (std::size_t z = 0; z < shoebox.zsize(); ++z) {
+      raw_projected_intensity_out[z] = result.raw_projected_intensity[z];
+      projected_intensity_out[z] = result.projected_intensity[z];
+      projected_background_out[z] = result.projected_background[z];
+      tof_z_out[z] = result.tof_z[z];
+    }
+
+    double I_prf = 0;
+    double var_prf = 0;
+    bool profile_success = false;
+    scitbx::af::versa<double, scitbx::af::c_grid<3>> profile_3d_out(
+      result.intensity_3d.accessor());
+
+    if (result.success) {
+      profile_success = fit_profile_3d_lp(result.coords_3d.const_ref(),
+                                          result.intensity_3d,
+                                          result.background_var_3d,
+                                          result.gain_3d,
+                                          result.tof_z.const_ref(),
+                                          profile_params_3d_lp,
+                                          I_prf,
+                                          var_prf,
+                                          profile_3d_out,
+                                          true);
     }
     return boost::python::make_tuple(I_prf,
                                      var_prf,

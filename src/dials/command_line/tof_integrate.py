@@ -36,6 +36,7 @@ from dials_algorithms_tof_integration_ext import (
     TOFProfile3DGutmannParams,
     TOFProfile3DIBIXParams,
     TOFProfile3DICParams,
+    TOFProfile3DLPParams,
     integrate_reflection_table,
     tof_calculate_ellipse_shoebox_mask,
     tof_calculate_seed_skewness_shoebox_mask,
@@ -79,7 +80,7 @@ calculated{
     .help = "The resolution spots are integrated to when using integration_type.calculated"
 
 }
-method = *summation profile_1d_ibix profile_1d_ic profile_3d_gutmann profile_3d_ic profile_3d_ibix
+method = *summation profile_1d_ibix profile_1d_ic profile_3d_gutmann profile_3d_ic profile_3d_ibix profile_3d_lp
     .type = choice
     .help = "Integration method: "
             "summation: shoebox summation"
@@ -90,7 +91,10 @@ method = *summation profile_1d_ibix profile_1d_ic profile_3d_gutmann profile_3d_
             "profile_3d_ic: separable Ikeda-Carpenter x bivariate Gaussian model, "
             "https://doi.org/10.1016/0168-9002(85)90033-6"
             "profile_3d_ibix: separable iBIX x bivariate Gaussian model, "
-            "https://doi.org/10.1038/srep36628"
+            "https://doi.org/10.1038/srep36628 "
+            "profile_3d_lp: separable long-pulse x bivariate Gaussian model for "
+            "long-pulse sources (e.g. ESS NMX): rectangular proton pulse "
+            "convolved with an exponential moderator emission and a Gaussian"
 
 mask = *ellipse seed_skewness
     .type = choice
@@ -359,6 +363,125 @@ profile_3d_ibix{
         .help = "Scales the per-reflection dXdt/dYdt bounds relative to the "
                 "shoebox's spatial extent divided by its ToF extent"
 }
+profile_3d_lp{
+    pulse_width = 2860.0
+        .type = float(value_min=0)
+        .help = "Proton pulse length (us): the width of the plateau of a peak "
+                "in time of flight. 2860 us at ESS."
+    optimize_pulse_width = False
+        .type = bool
+        .help = "Refine the plateau width per reflection, within "
+                "[min_pulse_width_factor, max_pulse_width_factor] x pulse_width. "
+                "If False it is held at pulse_width."
+    min_pulse_width_factor = 0.5
+        .type = float(value_min=0)
+        .help = "Lower bound of the plateau width, as a fraction of pulse_width"
+    max_pulse_width_factor = 1.5
+        .type = float(value_min=0)
+        .help = "Upper bound of the plateau width, as a fraction of pulse_width"
+    tau = 100.0
+        .type = float(value_min=0)
+        .help = "Moderator emission time constant (us). It is degenerate with "
+                "the onset and sigma on the leading edge of the peak, so it is "
+                "best calibrated once and held fixed."
+    optimize_emission = False
+        .type = bool
+        .help = "Refine tau per reflection, within [min_tau, max_tau]"
+    min_tau = 1.0
+        .type = float(value_min=0)
+        .help = "Min moderator emission time constant (us) for optimization"
+    max_tau = 2000.0
+        .type = float(value_min=0)
+        .help = "Max moderator emission time constant (us) for optimization"
+    init_sigma = 300.0
+        .type = float(value_min=0)
+        .help = "Initial Gaussian broadening (us): mosaicity, divergence, "
+                "detector and chopper timing"
+    min_sigma = 1.0
+        .type = float(value_min=0)
+        .help = "Min Gaussian broadening (us) for optimization"
+    max_sigma = 5000.0
+        .type = float(value_min=0)
+        .help = "Max Gaussian broadening (us) for optimization"
+    min_sig_x = 0.05
+        .type = float
+        .help = "Min bivariate Gaussian sigma X for optimization"
+    max_sig_x = 20.0
+        .type = float
+        .help = "Max bivariate Gaussian sigma X for optimization"
+    min_sig_y = 0.05
+        .type = float
+        .help = "Min bivariate Gaussian sigma Y for optimization"
+    max_sig_y = 20.0
+        .type = float
+        .help = "Max bivariate Gaussian sigma Y for optimization"
+    init_sig_p = 0.0
+        .type = float
+        .help = "Initial bivariate Gaussian spatial correlation before optimization"
+    min_sig_p = -0.95
+        .type = float
+        .help = "Min bivariate Gaussian spatial correlation for optimization"
+    max_sig_p = 0.95
+        .type = float
+        .help = "Max bivariate Gaussian spatial correlation for optimization"
+    n_restarts = 5
+        .type = int(value_min=0)
+        .help = "If fit fails, number of additional attempts with perturbed params. "
+                "Each failed attempt costs about as much as a full fit, so this "
+                "mostly sets the time spent on reflections that are rejected."
+    max_drift_factor = 1.5
+        .type = float
+        .help = "Scales the per-reflection dXdt/dYdt bounds relative to the "
+                "shoebox's spatial extent divided by its ToF extent"
+    min_correlation = 0.75
+        .type = float(value_min=0, value_max=1)
+        .help = "Correlation with the data that a reflection fitted on its own must"
+                "reach, both for its ToF projection (over the whole box) and for its"
+                "XY projection (over the pixels where the model is at least 5% of"
+                "its maximum)."
+    plateau_height_fraction = 0.25
+        .type = float(value_min=0)
+        .help = "Allowed relative difference between the plateau height of the"
+                "ToF projection of a reflection fitted on its own and the data's"
+                "mean over the plateau. 0 disables the test."
+    library{
+        build = False
+            .type = bool
+            .help = "Measure the shape on strong reflections, and fit every"
+                    "reflection with the shape of the nearest of those held"
+                    "fixed, at its prediction corrected by the median offset the"
+                    "library measured on its panel. Needs predictions (xyzcal.px"
+                    "and tof_cal)."
+        min_i_sigma = 20.0
+            .type = float(value_min=0)
+            .help = "Summation I/sigma a reflection must reach for its fitted"
+                    "shape to enter the library."
+        min_correlation = 0.85
+            .type = float(value_min=0, value_max=1)
+            .help = "Correlation of both projections a free fit must reach for"
+                    "its shape to enter the library."
+        min_entries_per_panel = 10
+            .type = int(value_min=1)
+            .help = "Entries a panel must hold for its own median offset from the"
+                    "predictions to be used; otherwise the whole detector's is."
+        free_position_min_i_sigma = 10.0
+            .type = float
+            .help = "A reflection is first fitted at its expected position with"
+                    "only the amplitude free and the shape broadened by how far"
+                    "the library's own peaks scatter about their expected"
+                    "positions: a weak peak's counts cannot place it, and a"
+                    "position fitted to them finds the brightest noise and reads"
+                    "the intensity high. Where that first fit reaches this"
+                    "I/sigma the position is fitted as well, with the"
+                    "unbroadened shape."
+        position_tolerance = 3.0
+            .type = float(value_min=0)
+            .help = "How far a fitted position may move from the expected one:"
+                    "this many times the scatter of the library's own offsets"
+                    "(at least 1 px on the detector and one ToF bin)."
+    }
+}
+
 
 mp{
     nproc = auto
@@ -506,6 +629,7 @@ def integrate_reflection_table_for_experiment(
     profile_3d_gutmann_params = None
     profile_3d_ic_params = None
     profile_3d_ibix_params = None
+    profile_3d_lp_params = None
     incident_params = None
     absorption_params = None
 
@@ -640,6 +764,54 @@ def integrate_reflection_table_for_experiment(
             }
         )
 
+    elif params.method == "profile_3d_lp":
+        p = params.profile_3d_lp
+        if p.min_pulse_width_factor > p.max_pulse_width_factor:
+            raise ValueError(
+                f"profile_3d_lp.min_pulse_width_factor ({p.min_pulse_width_factor}) "
+                f"is larger than profile_3d_lp.max_pulse_width_factor "
+                f"({p.max_pulse_width_factor})"
+            )
+        for name in ("tau", "sigma"):
+            lo, hi = getattr(p, f"min_{name}"), getattr(p, f"max_{name}")
+            if lo > hi:
+                raise ValueError(
+                    f"profile_3d_lp.min_{name} ({lo}) is larger than "
+                    f"profile_3d_lp.max_{name} ({hi})"
+                )
+        # dict needed due to boost limit of 15 template arguments
+        profile_3d_lp_params = TOFProfile3DLPParams(
+            {
+                "pulse_width": p.pulse_width,
+                "optimize_pulse_width": p.optimize_pulse_width,
+                "pulse_width_min_factor": p.min_pulse_width_factor,
+                "pulse_width_max_factor": p.max_pulse_width_factor,
+                "tau": p.tau,
+                "tau_min": p.min_tau,
+                "tau_max": p.max_tau,
+                "optimize_emission": p.optimize_emission,
+                "sigma": p.init_sigma,
+                "sigma_min": p.min_sigma,
+                "sigma_max": p.max_sigma,
+                "SigX_min": p.min_sig_x,
+                "SigX_max": p.max_sig_x,
+                "SigY_min": p.min_sig_y,
+                "SigY_max": p.max_sig_y,
+                "SigP": p.init_sig_p,
+                "SigP_min": p.min_sig_p,
+                "SigP_max": p.max_sig_p,
+                "n_restarts": p.n_restarts,
+                "optimize_profile": True,
+                "max_drift_factor": p.max_drift_factor,
+                "show_profile_failures": show_profile_failures,
+                "min_correlation": p.min_correlation,
+                "plateau_height_fraction": p.plateau_height_fraction,
+                "library_mode": False,
+                "free_position_min_i_sigma": p.library.free_position_min_i_sigma,
+                "position_tolerance": p.library.position_tolerance,
+            }
+        )
+
     if apply_lorentz:
         logger.info("    Adding Lorentz correction")
 
@@ -670,9 +842,147 @@ def integrate_reflection_table_for_experiment(
         profile_3d_gutmann_params,
         profile_3d_ic_params,
         profile_3d_ibix_params,
+        profile_3d_lp_params,
     )
 
+    if profile_3d_lp_params is not None and params.profile_3d_lp.library.build:
+        if set_lp_library_columns(expt_reflections, params.profile_3d_lp.library):
+            profile_3d_lp_params.library_mode = True
+            logger.info("    Fitting every reflection with its library shape")
+            integrate_reflection_table(
+                expt_reflections,
+                expt,
+                expt_data,
+                incident_params,
+                absorption_params,
+                apply_lorentz,
+                params.mp.nproc,
+                profile_3d_lp_params=profile_3d_lp_params,
+            )
+        for name in list(expt_reflections.keys()):
+            if name.startswith("lp_library."):
+                del expt_reflections[name]
+
     return expt_reflections
+
+
+def _robust_sd(values: np.ndarray) -> float:
+    """1.4826 times the median absolute deviation from the median"""
+    if len(values) == 0:
+        return 0.0
+    return float(1.4826 * np.median(np.abs(values - np.median(values))))
+
+
+def set_lp_library_columns(
+    reflections: flex.reflection_table, library_params: libtbx.phil.scope_extract
+) -> bool:
+    """
+    Build the profile_3d_lp library from a first, free pass and write, for
+    every reflection, the shape of the nearest library entry (same panel where
+    it holds any) and where the reflection is expected: its prediction
+    corrected by the median offset of the library's own fitted centres from
+    their predictions, on its panel where that holds min_entries_per_panel
+    entries and over the whole detector otherwise. The scatter of the entries
+    about those medians says how well a position is known. Returns False if
+    no library could be built.
+    """
+
+    n = len(reflections)
+    if n == 0 or "tof_cal" not in reflections or "xyzcal.px" not in reflections:
+        logger.info("    No predictions (xyzcal.px, tof_cal): no profile library")
+        return False
+
+    shape_names = ("W", "tau", "sigma", "sig_x", "sig_y", "sig_p", "dxdt", "dydt")
+    shape = np.column_stack(
+        [reflections[f"profile.lp.{k}"].as_numpy_array() for k in shape_names]
+    )
+    centre = reflections["profile.lp.centre"].as_numpy_array()
+    cc = np.minimum(
+        reflections["profile.lp.cc_tof"].as_numpy_array(),
+        reflections["profile.lp.cc_xy"].as_numpy_array(),
+    )
+    pred = np.column_stack(
+        [
+            reflections["xyzcal.px"].parts()[0].as_numpy_array(),
+            reflections["xyzcal.px"].parts()[1].as_numpy_array(),
+            reflections["tof_cal"].as_numpy_array(),
+        ]
+    )
+    panel = reflections["panel"].as_numpy_array().astype(int)
+    I = reflections["intensity.sum.value"].as_numpy_array()
+    V = reflections["intensity.sum.variance"].as_numpy_array()
+    i_sigma = np.where(V > 0, I / np.sqrt(np.where(V > 0, V, 1.0)), 0.0)
+    fitted = reflections.get_flags(reflections.flags.integrated_prf).as_numpy_array()
+
+    entry = (
+        fitted
+        & (i_sigma >= library_params.min_i_sigma)
+        & (cc >= library_params.min_correlation)
+        & np.all(np.isfinite(shape), axis=1)
+        & np.all(np.isfinite(centre), axis=1)
+        & np.all(np.isfinite(pred), axis=1)
+    )
+    n_entries = int(entry.sum())
+    logger.info(
+        f"    Profile library holds {n_entries} shapes "
+        f"(summation I/sigma >= {library_params.min_i_sigma}, "
+        f"correlation >= {library_params.min_correlation})"
+    )
+    if n_entries == 0:
+        return False
+
+    # Offsets of the library's fitted centres from their predictions
+    offsets = centre[entry] - pred[entry]
+    entry_panel = panel[entry]
+    global_offset = np.median(offsets, axis=0)
+    panel_offset = {}
+    for p in np.unique(entry_panel):
+        sel = entry_panel == p
+        if sel.sum() >= library_params.min_entries_per_panel:
+            panel_offset[int(p)] = np.median(offsets[sel], axis=0)
+    applied = np.array(
+        [panel_offset.get(int(p), global_offset) for p in entry_panel]
+    ).reshape(-1, 3)
+    scatter = np.array([_robust_sd(offsets[:, k] - applied[:, k]) for k in range(3)])
+    logger.info(
+        "    Library offset from the predictions (x px, y px, ToF us): "
+        + ", ".join(f"{v:.2f}" for v in global_offset)
+        + "; scatter "
+        + ", ".join(f"{v:.2f}" for v in scatter)
+        + f"; panels with their own offset: {sorted(panel_offset)}"
+    )
+
+    # Nearest entry on the same panel (any panel where it has none)
+    entry_idx = np.where(entry)[0]
+    nearest = np.empty(n, dtype=int)
+    for p in np.unique(panel):
+        rows = np.where(panel == p)[0]
+        candidates = entry_idx[panel[entry_idx] == p]
+        if len(candidates) == 0:
+            candidates = entry_idx
+        d2 = (pred[rows, None, 0] - pred[None, candidates, 0]) ** 2 + (
+            pred[rows, None, 1] - pred[None, candidates, 1]
+        ) ** 2
+        nearest[rows] = candidates[np.argmin(d2, axis=1)]
+
+    expected = pred + np.array(
+        [panel_offset.get(int(p), global_offset) for p in panel]
+    ).reshape(-1, 3)
+    valid = np.all(np.isfinite(pred), axis=1)
+    for k, name in enumerate(shape_names):
+        reflections[f"lp_library.{name}"] = flex.double(
+            np.ascontiguousarray(shape[nearest, k])
+        )
+
+    def vec3(a):
+        return flex.vec3_double(
+            *(flex.double(np.ascontiguousarray(a[:, k])) for k in range(3))
+        )
+
+    reflections["lp_library.expected"] = vec3(np.nan_to_num(expected))
+    reflections["lp_library.scatter"] = vec3(np.tile(scatter, (n, 1)))
+    reflections["lp_library.valid"] = flex.bool(valid.tolist())
+    return True
 
 
 def compute_tof_centroids(
