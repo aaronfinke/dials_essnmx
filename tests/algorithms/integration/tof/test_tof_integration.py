@@ -160,3 +160,47 @@ def test_tof_integration(dials_data, tmp_path):
     integrated = flex.reflection_table.from_file(join(tmp_path, "integrated.refl"))
     fitted = integrated.get_flags(integrated.flags.integrated_prf)
     assert fitted.count(True) > 0.5 * len(integrated)
+
+    # 3D profile fitting (long pulse x bivariate Gaussian). SXD is a
+    # short-pulse source, so the plateau width is set short; this checks the
+    # method runs through the pipeline, not how well it fits SXD
+    result = subprocess.run(
+        [
+            shutil.which("dials.tof_integrate"),
+            expt_path,
+            refl_path,
+            "method=profile_3d_lp",
+            "profile_3d_lp.pulse_width=20",
+            "output.reflections=integrated_lp.refl",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+    )
+    assert not result.returncode and not result.stderr
+    integrated = flex.reflection_table.from_file(join(tmp_path, "integrated_lp.refl"))
+    assert "intensity.prf.value" in integrated
+    assert "intensity.prf.variance" in integrated
+
+    # The same with a profile library: every reflection with a prediction is
+    # fitted with the shape of the nearest strong one
+    result = subprocess.run(
+        [
+            shutil.which("dials.tof_integrate"),
+            expt_path,
+            refl_path,
+            "method=profile_3d_lp",
+            "profile_3d_lp.pulse_width=20",
+            "profile_3d_lp.library.build=True",
+            "profile_3d_lp.library.min_i_sigma=5",
+            "profile_3d_lp.library.min_correlation=0.5",
+            "output.reflections=integrated_lp_library.refl",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+    )
+    assert not result.returncode and not result.stderr
+    integrated = flex.reflection_table.from_file(
+        join(tmp_path, "integrated_lp_library.refl")
+    )
+    assert "intensity.prf.value" in integrated
+    assert not any(k.startswith("lp_library.") for k in integrated.keys())
